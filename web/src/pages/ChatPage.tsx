@@ -32,6 +32,7 @@ import { useSearchParams } from "react-router";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
 import { ChatSessionList } from "@/components/ChatSessionList";
+import { VoiceControls } from "@/components/VoiceControls";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
@@ -197,6 +198,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   );
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyWaiterRef = useRef<{
+    resolve: (text: string) => void;
+    reject: (reason: Error) => void;
+    timer: number;
+  } | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
   const forceFreshPtyRef = useRef(false);
@@ -452,9 +458,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     return () => setEnd(null);
   }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, setEnd]);
 
-  const handleCopyLast = () => {
+  const driveCopyLast = useCallback(() => {
     const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     // Send the slash as a burst, wait long enough for Ink's tokenizer to
     // emit a keypress event for each character (not coalesce them into a
     // paste), then send Return as its own event.  The timing here is
@@ -465,11 +471,40 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       const s = wsRef.current;
       if (s && s.readyState === WebSocket.OPEN) s.send("\r");
     }, 100);
+    return true;
+  }, []);
+
+  const handleCopyLast = () => {
+    if (!driveCopyLast()) return;
     setCopyState("copied");
     if (copyResetRef.current) clearTimeout(copyResetRef.current);
     copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
     termRef.current?.focus();
   };
+
+  const readLastAssistantResponse = useCallback(
+    () =>
+      new Promise<string>((resolve, reject) => {
+        const previous = copyWaiterRef.current;
+        if (previous) {
+          window.clearTimeout(previous.timer);
+          previous.reject(new Error("La lectura anterior fue reemplazada."));
+        }
+        const timer = window.setTimeout(() => {
+          if (copyWaiterRef.current?.timer === timer) {
+            copyWaiterRef.current = null;
+          }
+          reject(new Error("Hermes todavía no tiene una respuesta para leer."));
+        }, 4_000);
+        copyWaiterRef.current = { resolve, reject, timer };
+        if (!driveCopyLast()) {
+          window.clearTimeout(timer);
+          copyWaiterRef.current = null;
+          reject(new Error("El chat no está conectado."));
+        }
+      }),
+    [driveCopyLast],
+  );
 
   useEffect(() => {
     // Don't spawn the chat PTY (and the TUI/agent bootstrap it triggers)
@@ -559,6 +594,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         const binary = atob(payload);
         const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
         const text = new TextDecoder("utf-8").decode(bytes);
+        const waiter = copyWaiterRef.current;
+        if (waiter) {
+          window.clearTimeout(waiter.timer);
+          copyWaiterRef.current = null;
+          waiter.resolve(text);
+        }
         navigator.clipboard.writeText(text).catch((err) => {
           // Most common reason: the Clipboard API requires a user gesture.
           // This can fail when the OSC 52 response arrives outside the
@@ -1310,6 +1351,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         clearTimeout(copyResetRef.current);
         copyResetRef.current = null;
       }
+      if (copyWaiterRef.current) {
+        clearTimeout(copyWaiterRef.current.timer);
+        copyWaiterRef.current.reject(
+          new Error("El chat se reinició antes de copiar la respuesta."),
+        );
+        copyWaiterRef.current = null;
+      }
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
@@ -1426,6 +1474,27 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     if (!term) return;
     term.options.theme = terminalTheme;
   }, [terminalTheme]);
+
+  const sendVoiceTranscript = useCallback((text: string): boolean => {
+    const ws = wsRef.current;
+    const clean = text.replace(/[\r\n]+/g, " ").trim();
+    if (
+      !clean ||
+      !ws ||
+      ws.readyState !== WebSocket.OPEN ||
+      shouldBlockPtyInput(ptyStateRef.current)
+    ) {
+      return false;
+    }
+    ptyInputLineRef.current = "";
+    ws.send(clean);
+    window.setTimeout(() => {
+      const active = wsRef.current;
+      if (active?.readyState === WebSocket.OPEN) active.send("\r");
+    }, 100);
+    termRef.current?.focus();
+    return true;
+  }, []);
 
   // Layout:
   //   outer flex column — sits inside the dashboard's content area
@@ -1620,6 +1689,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               </Button>
             </div>
           )}
+
+          <VoiceControls
+            connected={ptyState === "open"}
+            profile={scopedProfile || undefined}
+            onReadLastResponse={readLastAssistantResponse}
+            onSendTranscript={sendVoiceTranscript}
+          />
 
           <Button
             ghost

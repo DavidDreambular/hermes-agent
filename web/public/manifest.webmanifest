@@ -1,0 +1,19 @@
+{
+  "name": "Hermes Privado",
+  "short_name": "Hermes",
+  "description": "Acceso privado por voz a Hermes Agent",
+  "start_url": "/chat",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "lang": "es",
+  "icons": [
+    {
+      "src": "/hermes-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -12,6 +12,17 @@ import { HERMES_BASE_PATH } from "./lib/api";
 // can access React, components, etc. immediately.
 exposePluginSDK();
 
+// Installable mobile shell without offline caching: authenticated chat and
+// voice data must always come from the private live service.
+if ("serviceWorker" in navigator && import.meta.env.PROD) {
+  const base = HERMES_BASE_PATH || "";
+  window.addEventListener("load", () => {
+    void navigator.serviceWorker.register(`${base}/sw.js`, {
+      scope: base ? `${base}/` : "/",
+    });
+  });
+}
+
 createRoot(document.getElementById("root")!).render(
   <BrowserRouter basename={HERMES_BASE_PATH || undefined}>
     <I18nProvider>
