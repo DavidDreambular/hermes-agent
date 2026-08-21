@@ -18271,7 +18271,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
-def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
+def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> dict:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
     Called from the quiet single-query path AFTER the worker's first turn,
@@ -18279,13 +18279,15 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     goal_mode card). Wires the worker's ``run_conversation`` and the kanban
     DB into ``goals.run_kanban_goal_loop``. All errors are swallowed by the
     caller — a broken goal loop must never wedge a worker, the dispatcher's
-    claim TTL / crash detection is the backstop.
+    claim TTL / crash detection is the backstop. A terminalization failure is
+    returned to the caller so it can exit non-zero; swallowing that outcome
+    would turn a failed DB write into a clean-exit protocol violation.
     """
     import os as _os
 
     task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
-        return
+        return {"outcome": "stopped", "reason": "no kanban task id"}
     worker_run_id = None
     raw_run_id = (_os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
     if raw_run_id:
@@ -18293,6 +18295,11 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             worker_run_id = int(raw_run_id)
         except ValueError:
             logger.warning("invalid HERMES_KANBAN_RUN_ID=%r", raw_run_id)
+    if worker_run_id is None:
+        # A goal worker without a run identity cannot safely read or mutate
+        # lifecycle state. Do not fall back to task-wide operations: an old
+        # worker must never close a successor run.
+        raise RuntimeError("kanban worker run identity unavailable")
 
     from hermes_cli import kanban_db as _kb
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
@@ -18308,14 +18315,14 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         except Exception:
             pass
     if task is None:
-        return
+        return {"outcome": "stopped", "reason": "task not found"}
 
     goal_parts = [task.title or ""]
     if task.body:
         goal_parts.append(task.body)
     goal_text = "\n\n".join(p for p in goal_parts if p).strip()
     if not goal_text:
-        return
+        return {"outcome": "stopped", "reason": "empty goal"}
 
     max_turns = task.goal_max_turns or _DEF_TURNS
 
@@ -18345,22 +18352,24 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
-    def _block(reason: str) -> None:
+    def _block(reason: str) -> bool:
         c = _kb.connect()
         try:
-            _kb.block_task(
+            from agent.redact import redact_sensitive_text as _redact
+
+            return bool(_kb.block_task(
                 c,
                 task_id,
-                reason=reason,
+                reason=_redact(str(reason), force=True),
                 expected_run_id=worker_run_id,
-            )
+            ))
         finally:
             try:
                 c.close()
             except Exception:
                 pass
 
-    _run_loop(
+    return _run_loop(
         task_id=task_id,
         goal_text=goal_text,
         run_turn=_run_turn,
@@ -18879,11 +18888,39 @@ def main(
                         # out (→ sticky block). Gated on the env vars the
                         # dispatcher sets in `_default_spawn`; a no-op for every
                         # normal worker and every non-kanban `-q` run.
-                        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+                        _goal_loop_error = None
+                        if (
+                            os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1"
+                            and not (
+                                isinstance(result, dict)
+                                and result.get("failed")
+                            )
+                        ):
                             try:
-                                _run_kanban_goal_loop_q(cli, response)
+                                _goal_result = _run_kanban_goal_loop_q(cli, response)
+                                if _goal_result.get("outcome") == "terminalization_failed":
+                                    _goal_loop_error = (
+                                        "kanban goal terminalization failed; "
+                                        "the task state was not durably recorded"
+                                    )
+                                elif (
+                                    _goal_result.get("outcome") == "stopped"
+                                    and str(_goal_result.get("reason", "")).startswith(
+                                        ("status check failed", "run_turn error")
+                                    )
+                                ):
+                                    _goal_loop_error = (
+                                        "kanban goal loop failed before terminalizing "
+                                        "the task"
+                                    )
                             except Exception as _goal_exc:
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
+                                _goal_loop_error = (
+                                    "kanban goal loop failed before terminalizing "
+                                    "the task"
+                                )
+                        if _goal_loop_error:
+                            print(f"Error: {_goal_loop_error}", file=sys.stderr)
 
                         # Session ID goes to stderr so piped stdout is clean.
                         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
@@ -18903,6 +18940,9 @@ def main(
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
+                        if _goal_loop_error:
+                            _exit_code = 1
+                        if isinstance(result, dict) and result.get("failed"):
                             if os.environ.get("HERMES_KANBAN_TASK") and result.get(
                                 "failure_reason"
                             ) in ("rate_limit", "billing"):
