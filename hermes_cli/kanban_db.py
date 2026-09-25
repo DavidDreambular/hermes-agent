@@ -5904,6 +5904,23 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return is_managed
 
 
+def _remove_managed_scratch_workspace(path: Path) -> bool:
+    """Remove managed scratch storage while unregistering a nested Git worktree."""
+    from hermes_cli.kanban_workspace_gc import (
+        plan_scratch_workspace_cleanup,
+        remove_scratch_workspace,
+    )
+
+    plan = plan_scratch_workspace_cleanup(path, workspaces_root=workspaces_root())
+    if not plan.safe:
+        _log.warning("Refusing scratch workspace cleanup for %s: %s", path, plan.reason)
+        return False
+    removed, reason = remove_scratch_workspace(plan)
+    if not removed:
+        _log.warning("Could not clean scratch workspace %s: %s", path, reason)
+    return removed
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
@@ -5944,7 +5961,6 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
                 task_id, path,
             )
             return
-        import shutil
         wp = Path(path)
         if wp.is_dir():
             # Containment guard (#28818): a board's ``default_workdir`` can
@@ -5953,8 +5969,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # completion would unconditionally ``shutil.rmtree`` that path
             # and silently delete the user's source data.
             if _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Removed scratch workspace: %s", wp)
+                if _remove_managed_scratch_workspace(wp):
+                    _log.debug("Removed scratch workspace: %s", wp)
             else:
                 _log.warning(
                     "Refusing to remove out-of-scratch workspace for task %s: %s "
@@ -6004,11 +6020,13 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             if active:
                 continue  # still has active children
             # All children done — safe to clean up parent workspace
-            import shutil
             wp = Path(row["workspace_path"])
             if wp.is_dir() and _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+                if _remove_managed_scratch_workspace(wp):
+                    _log.debug(
+                        "Deferred cleanup: removed parent %s scratch workspace: %s",
+                        parent_id, wp,
+                    )
     except Exception:
         pass  # best-effort
 
@@ -7464,12 +7482,14 @@ def decompose_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    now = int(time.time())
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
+            "    completed_at = COALESCE(completed_at, ?), "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status != 'archived'",
-            (task_id,),
+            (now, task_id),
         )
         if cur.rowcount != 1:
             return False

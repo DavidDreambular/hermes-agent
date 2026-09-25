@@ -990,6 +990,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc = sub.add_parser(
         "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
     )
+    p_gc.add_argument("--dry-run", action="store_true",
+                      help="Report eligible cleanup without deleting anything")
+    p_gc.add_argument("--workspace-retention-days", type=int, default=30,
+                      help="Keep done/archived scratch workspaces newer than N days (default: 30)")
     p_gc.add_argument("--event-retention-days", type=int, default=30,
                       help="Delete task_events older than N days for terminal tasks (default: 30)")
     p_gc.add_argument("--log-retention-days", type=int, default=30,
@@ -3210,34 +3214,87 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
-    """Remove scratch workspaces of archived tasks, prune old events, and
-    delete old worker logs."""
-    import shutil
+    """Safely collect expired terminal-task scratch workspaces, events, and logs."""
+    from hermes_cli.kanban_workspace_gc import (
+        plan_scratch_workspace_cleanup,
+        remove_scratch_workspace,
+    )
+
+    workspace_days = getattr(args, "workspace_retention_days", 30)
+    event_days = getattr(args, "event_retention_days", 30)
+    log_days = getattr(args, "log_retention_days", 30)
+    if min(workspace_days, event_days, log_days) < 0:
+        print("kanban gc: retention days must be zero or greater", file=sys.stderr)
+        return 2
+
+    now = int(time.time())
+    workspace_cutoff = now - workspace_days * 24 * 3600
     scratch_root = kb.workspaces_root()
     removed_ws = 0
+    would_remove_ws = 0
+    skipped_ws = 0
     with kb.connect_closing() as conn:
         rows = conn.execute(
-            "SELECT id, workspace_kind, workspace_path FROM tasks WHERE status = 'archived'"
+            "SELECT t.id, t.status, t.workspace_kind, t.workspace_path, "
+            "COALESCE(t.completed_at, archived_at.created_at) AS terminal_at "
+            "FROM tasks AS t LEFT JOIN ("
+            "SELECT task_id, MAX(created_at) AS created_at FROM task_events "
+            "WHERE kind = 'archived' GROUP BY task_id"
+            ") AS archived_at ON archived_at.task_id = t.id "
+            "WHERE t.status IN ('done', 'archived') "
+            "AND COALESCE(t.completed_at, archived_at.created_at) < ?",
+            (workspace_cutoff,),
         ).fetchall()
     for row in rows:
         if row["workspace_kind"] != "scratch":
             continue
         path = Path(row["workspace_path"] or (scratch_root / row["id"]))
-        try:
-            path = path.resolve()
-        except OSError:
+        plan = plan_scratch_workspace_cleanup(path, workspaces_root=scratch_root)
+        if not plan.safe:
+            skipped_ws += 1
+            print(f"{row['id']}: skipped ({plan.reason})")
             continue
-        try:
-            path.relative_to(scratch_root.resolve())
-        except ValueError:
-            # Safety: never delete outside the scratch root.
-            continue
-        if path.exists() and path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
-            removed_ws += 1
+        if getattr(args, "dry_run", False):
+            would_remove_ws += 1
+            print(
+                f"{row['id']}: would remove {path} "
+                f"({plan.reclaimable_bytes} bytes)"
+            )
+        else:
+            removed, reason = remove_scratch_workspace(plan)
+            if removed:
+                removed_ws += 1
+                print(f"{row['id']}: removed {path} ({plan.reclaimable_bytes} bytes)")
+            else:
+                skipped_ws += 1
+                print(f"{row['id']}: skipped ({reason})")
 
-    event_days = getattr(args, "event_retention_days", 30)
-    log_days = getattr(args, "log_retention_days", 30)
+    dry_run = getattr(args, "dry_run", False)
+    if dry_run:
+        event_cutoff = now - event_days * 24 * 3600
+        with kb.connect_closing() as conn:
+            would_remove_events = conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE created_at < ? AND task_id IN "
+                "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))",
+                (event_cutoff,),
+            ).fetchone()[0]
+        log_dir = kb.worker_logs_dir()
+        log_cutoff = now - log_days * 24 * 3600
+        would_remove_logs = 0
+        if log_dir.exists():
+            for entry in log_dir.iterdir():
+                try:
+                    if entry.is_file() and entry.stat().st_mtime < log_cutoff:
+                        would_remove_logs += 1
+                except OSError:
+                    continue
+        print(
+            f"GC dry run: {would_remove_ws} workspace(s) would be removed, "
+            f"{skipped_ws} skipped, {would_remove_events} event row(s) and "
+            f"{would_remove_logs} log file(s) would be removed"
+        )
+        return 0
+
     with kb.connect_closing() as conn:
         removed_events = kb.gc_events(
             conn, older_than_seconds=event_days * 24 * 3600,
@@ -3245,7 +3302,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     removed_logs = kb.gc_worker_logs(
         older_than_seconds=log_days * 24 * 3600,
     )
-    print(f"GC complete: {removed_ws} workspace(s), "
+    print(f"GC complete: {removed_ws} workspace(s) removed, {skipped_ws} skipped, "
           f"{removed_events} event row(s), {removed_logs} log file(s) removed")
     return 0
 
