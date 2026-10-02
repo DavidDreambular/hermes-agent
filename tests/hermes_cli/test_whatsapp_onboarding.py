@@ -119,5 +119,6 @@ def test_start_whatsapp_onboarding_existing_creds_returns_linked_account(monkeyp
     _web_server_messaging._whatsapp_onboarding_sessions.clear()
 
 
-
+def test_whatsapp_phone_from_identifier_rejects_lid_jids():
+    assert _rt_messaging._whatsapp_phone_from_identifier("155512345678901:1@lid") is None
 
