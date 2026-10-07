@@ -112,6 +112,17 @@ def test_anonymous_policy_requires_current_snapshot_after_signature_verification
         module.verify_canonical(target, snapshot)
 
 
+def test_live_anonymous_github_policy_matches_writer_snapshot():
+    snapshot_path = Path("/signed-fixture/source-policy.json")
+    if os.geteuid() != 0 or not snapshot_path.exists():
+        pytest.skip("requires hosted isolated-root live policy fixture")
+    module = component()
+    target = module.source_json("branches/main")["commit"]["sha"]
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    # Real anonymous HTTPS, no monkeypatch or credential in the container.
+    module.verify_canonical(target, snapshot)
+
+
 def test_root_admit_real_signed_bundle_end_to_end(monkeypatch):
     fixture = Path("/signed-fixture")
     if os.geteuid() != 0 or not (fixture / "image.json").exists():
