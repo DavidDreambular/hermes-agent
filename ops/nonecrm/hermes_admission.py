@@ -21,6 +21,10 @@ POLICY = Path("/etc/production-guard/hermes-admission.json")
 DELEGATION = Path("/etc/production-guard/delegation.conf")
 STATE = Path("/var/lib/production-guard/hermes-artifacts")
 JOURNAL = Path("/var/lib/production-guard/hermes-bootstrap-transaction.json")
+PR_PARAMETERS = {"required_approving_review_count": 0, "dismiss_stale_reviews_on_push": False,
+                 "required_reviewers": [], "require_code_owner_review": False, "require_last_push_approval": False,
+                 "required_review_thread_resolution": True, "require_extra_approval_for_unattributed_changes": True,
+                 "allowed_merge_methods": ["merge", "squash", "rebase"]}
 
 
 def stage_path(target):
@@ -108,10 +112,12 @@ def verify_canonical(target):
     if branch.get("protected") is not True or branch.get("commit", {}).get("sha") != target:
         raise ValueError("source is not the exact protected canonical commit")
     ruleset = source_json("rulesets/24670342")
+    rules = {rule.get("type"): rule for rule in ruleset.get("rules", [])}
     if (ruleset.get("enforcement") != "active" or ruleset.get("bypass_actors") != []
             or "refs/heads/main" not in ruleset.get("conditions", {}).get("ref_name", {}).get("include", [])
             or ruleset.get("conditions", {}).get("ref_name", {}).get("exclude") != []
-            or not {"pull_request", "deletion", "non_fast_forward"}.issubset({rule.get("type") for rule in ruleset.get("rules", [])})):
+            or set(rules) != {"pull_request", "deletion", "non_fast_forward"}
+            or rules["pull_request"].get("parameters") != PR_PARAMETERS):
         raise ValueError("canonical source protection changed")
 
 
@@ -128,7 +134,7 @@ def validate_delegation(text):
         values[key] = value
     if (values.get("VERSION") != "1" or values.get("ENABLED") != "true"
             or values.get("HOST_ID") != "midpoints-vps" or values.get("ALLOWED_REPO_OWNER") != REPO.split("/")[0]
-            or "refs/heads/main" not in values.get("ALLOWED_CANONICAL_REFS", "refs/heads/main").split(",")):
+            or "refs/heads/main" not in values.get("ALLOWED_CANONICAL_REFS", "").split(",")):
         raise ValueError("superior delegation revoked or narrowed")
 
 
