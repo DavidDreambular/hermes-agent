@@ -1,6 +1,10 @@
 """Behavior checks for the fixed owner deployment admission boundary."""
 import importlib.util
+import json
+import os
 from pathlib import Path
+import shutil
+import tempfile
 
 import pytest
 
@@ -65,7 +69,8 @@ def test_superior_delegation_revocation_is_inherited():
     valid = "VERSION=1\nENABLED=true\nHOST_ID=midpoints-vps\nALLOWED_REPO_OWNER=DavidDreambular\nALLOWED_CANONICAL_REFS=refs/heads/main,refs/heads/master\n"
     module.validate_delegation(valid)
     for changed in [valid.replace("ENABLED=true", "ENABLED=false"), valid.replace("midpoints-vps", "other-host"),
-                    valid.replace("DavidDreambular", "other-owner"), valid.replace("refs/heads/main,", "")]:
+                    valid.replace("DavidDreambular", "other-owner"), valid.replace("refs/heads/main,", ""),
+                    "\n".join(line for line in valid.splitlines() if not line.startswith("ALLOWED_CANONICAL_REFS="))]:
         with pytest.raises(ValueError):
             module.validate_delegation(changed)
 
@@ -88,3 +93,49 @@ def test_receipt_binds_verification_time_and_active_policy(monkeypatch):
     assert result["verified_at"] == 123456
     assert result["policy_sha256"] == "d" * 64
     assert result["bootstrap_sha256"] == "e" * 64
+
+
+def test_root_admit_real_signed_bundle_end_to_end(monkeypatch):
+    fixture = Path("/signed-fixture")
+    if os.geteuid() != 0 or not (fixture / "image.json").exists():
+        pytest.skip("requires isolated root and genuine hosted signed artifact fixture")
+    module = component()
+    root = Path(tempfile.mkdtemp(prefix="signed-admit-", dir="/root"))
+    target = json.loads((fixture / "image.json").read_text())[0]["Config"]["Labels"]["org.opencontainers.image.revision"]
+    for key, value in {"STATE": root / "state", "TOOLS": root / "tools", "POLICY": root / "policy", "DELEGATION": root / "delegation", "JOURNAL": root / "journal"}.items():
+        monkeypatch.setattr(module, key, value)
+    module.TOOLS.mkdir()
+    sources = [(Path("/verifier-fixture/gh"), "hermes-gh", "gh_sha256", 0o755),
+               (Path("/verifier-fixture/trusted-root.jsonl"), "hermes-trusted-root.jsonl", "roots_sha256", 0o644),
+               (Path(module.__file__), "hermes-artifact-admit", "admission_sha256", 0o755)]
+    policy = {"schema": 1, "enabled": True, "service": "nonecrm-hermes-agent", "repository": module.REPO}
+    for source, name, key, mode in sources:
+        shutil.copyfile(source, module.TOOLS / name)
+        (module.TOOLS / name).chmod(mode)
+        policy[key] = module.secure_digest(module.TOOLS / name, 100_000_000)
+    module.POLICY.write_text(json.dumps(policy))
+    module.DELEGATION.write_text("VERSION=1\nENABLED=true\nHOST_ID=midpoints-vps\nALLOWED_REPO_OWNER=DavidDreambular\nALLOWED_CANONICAL_REFS=refs/heads/main\n")
+    module.JOURNAL.write_text(json.dumps({"phase": "committed", "manifest": {"admission.py": policy["admission_sha256"], "gh": policy["gh_sha256"], "trusted-root.jsonl": policy["roots_sha256"]}}))
+    for path in [module.POLICY, module.DELEGATION, module.JOURNAL]:
+        path.chmod(0o600)
+    rules = [{"type": "deletion"}, {"type": "non_fast_forward"}, {"type": "pull_request", "parameters": module.PR_PARAMETERS}]
+    monkeypatch.setattr(module, "source_json", lambda endpoint: {"protected": True, "commit": {"sha": target}} if endpoint == "branches/main" else {"enforcement": "active", "bypass_actors": [], "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}}, "rules": rules})
+    try:
+        module.admit(target, prepare=True)
+        stage = module.stage_path(target)
+        for name in ["image.tar.gz", "image.json", "attestation.json"]:
+            shutil.copyfile(fixture / name, stage / name)
+        module.admit(target)
+        receipt = json.loads((stage / "admitted.json").read_text())
+        assert receipt["source"] == target and receipt["image"].startswith("sha256:")
+        assert receipt["policy_sha256"] == module.secure_digest(module.POLICY, 16384)
+        (stage / "admitted.json").unlink()
+        (stage / "image.json").write_text("corrupted signed metadata")
+        with pytest.raises(module.subprocess.CalledProcessError):
+            module.admit(target)
+        assert not (stage / "admitted.json").exists()
+        rules[2]["parameters"] = {**module.PR_PARAMETERS, "required_review_thread_resolution": False}
+        with pytest.raises(ValueError, match="protection"):
+            module.verify_canonical(target)
+    finally:
+        shutil.rmtree(root)
