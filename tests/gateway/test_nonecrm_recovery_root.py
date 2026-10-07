@@ -14,7 +14,7 @@ import pytest
 
 
 @pytest.mark.linux_only
-@pytest.mark.parametrize("failure", [None, "signature", "candidate-exit", "rename", "journal", "probe", "exited-journal", "live-success", "pause-response"])
+@pytest.mark.parametrize("failure", [None, "signature", "candidate-exit", "rename", "journal", "probe", "exited-journal", "live-success", "pause-response", "native-repeat"])
 def test_isolated_fixed_recovery_transaction(failure):
     if os.geteuid() != 0 or socket.gethostname() != "MidPointsIA" or not Path("/.dockerenv").exists():
         pytest.skip("requires dedicated isolated Docker root fixture without host socket")
@@ -23,13 +23,16 @@ def test_isolated_fixed_recovery_transaction(failure):
     source = Path("/opt/production-sources/nonecrm-hermes-agent-source")
     assert not source.exists()
     target, expected = "a" * 40, "2bd1977d8fad185c9b4be47884f7e87f1add0ce3"
-    live = failure in {"live-success", "pause-response"}
-    failed = failure not in {None, "live-success"}
+    live = failure in {"live-success", "pause-response", "native-repeat"}
+    repeat = failure == "native-repeat"
+    failed = failure is not None and not repeat
     if live:
         expected = "c" * 40
     old_id = "cf415bbe164a37938c9b655a112fba51150206818c1d1c7e4595c86fd090b2d0"
     old_image = "sha256:b2ee88947e66c349dbefeae5c6e1fd846d7b4d5f938fe2d3f04aeeecc09c11fc"
     image_id = "sha256:" + "b" * 64
+    if repeat:
+        expected, old_image = target, image_id
     home = Path("/var/lib/docker/volumes/1abf8bf156c0b133516d33681e3088327c993b670b773e608a729cc77194fe1e/_data")
     stage = Path("/var/lib/production-guard/hermes-artifacts") / target
     config = Path("/etc/production-guard/services.d/nonecrm-hermes-agent--production.conf")
@@ -66,6 +69,8 @@ def test_isolated_fixed_recovery_transaction(failure):
         Path("/usr/bin/python3").symlink_to("/usr/local/bin/python3")
     old = {"Id": old_id, "Name": "/nonecrm-hermes-agent", "Image": old_image, "State": {"Status": "running" if live else "exited", "Running": live},
            "Config": {"Labels": {"org.opencontainers.image.revision": expected, "nonecrm.managed": "native-hermes-v1"}}, "Mounts": [{"Destination": "/opt/data", "Source": str(home)}]}
+    if repeat:
+        old["State"]["Health"] = {"Status": "healthy"}
     operations, new = [], {}
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
@@ -128,12 +133,15 @@ def test_isolated_fixed_recovery_transaction(failure):
         assert (home / "history.txt").read_text() == "preserve-existing-state"
         assert "fixture-key" not in result.stdout + result.stderr
         exposed = any("/networks/" in path for _, path, _ in operations)
-        assert exposed is (not failed)
+        assert exposed is (not failed and not repeat)
         assert old["State"].get("Paused", False) is False
+        if live:
+            assert old["State"]["Running"] and not new
+            assert all(method == "GET" for method, _, _ in operations)
         if new and failed:
             assert new["State"]["Running"] is False
             assert old["Name"] == "/nonecrm-hermes-agent"
-        if not failed:
+        if not failed and not repeat:
             transaction = json.loads((Path("/opt/apps/nonecrm-hermes-native") / target / "transaction.json").read_text())
             assert transaction["traffic_committed"] and transaction["phase"] == "private-ready"
             assert transaction["old_runtime_usable"] is live
