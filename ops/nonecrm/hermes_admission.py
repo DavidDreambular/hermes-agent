@@ -107,18 +107,29 @@ def source_json(endpoint):
     return json.loads(raw)
 
 
-def verify_canonical(target):
+def verify_canonical(target, policy_snapshot=None, prepare=False):
     branch = source_json("branches/main")
     if branch.get("protected") is not True or branch.get("commit", {}).get("sha") != target:
         raise ValueError("source is not the exact protected canonical commit")
     ruleset = source_json("rulesets/24670342")
     rules = {rule.get("type"): rule for rule in ruleset.get("rules", [])}
-    if (ruleset.get("enforcement") != "active" or ruleset.get("bypass_actors") != []
+    if (ruleset.get("enforcement") != "active"
             or "refs/heads/main" not in ruleset.get("conditions", {}).get("ref_name", {}).get("include", [])
             or ruleset.get("conditions", {}).get("ref_name", {}).get("exclude") != []
             or set(rules) != {"pull_request", "deletion", "non_fast_forward"}
             or rules["pull_request"].get("parameters") != PR_PARAMETERS):
         raise ValueError("canonical source protection changed")
+    bypass = ruleset.get("bypass_actors")
+    if bypass is not None and bypass != []:
+        raise ValueError("canonical source bypass changed")
+    if bypass is None and not prepare:
+        # Anonymous GitHub reads omit bypass actors. A genuinely signed build
+        # snapshot plus the public live ruleset revision closes that read gap.
+        if (not isinstance(policy_snapshot, dict) or policy_snapshot.get("id") != 24670342
+                or policy_snapshot.get("bypass_actors") != [] or not ruleset.get("updated_at")
+                or any(policy_snapshot.get(key) != ruleset.get(key) for key in
+                       ["updated_at", "enforcement", "conditions", "rules", "source"])):
+            raise ValueError("signed current source-policy snapshot required")
 
 
 def validate_delegation(text):
@@ -183,7 +194,7 @@ def admit(target, prepare=False):
         if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600:
             raise ValueError("unsafe admission lock")
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        verify_canonical(target)
+        verify_canonical(target, prepare=True)
         secure_directory(stage)
         if prepare:
             print(stage)
@@ -197,8 +208,9 @@ def admit(target, prepare=False):
                                env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
         if any(secure_digest(stage / name, 1_000_000_000) != digest for name, digest in hashes.items()):
             raise ValueError("artifact changed during verification")
-        image_id = validate_image(json.loads((stage / "image.json").read_text(encoding="utf-8")), target)
-        verify_canonical(target)
+        metadata = json.loads((stage / "image.json").read_text(encoding="utf-8"))
+        image_id = validate_image(metadata, target)
+        verify_canonical(target, metadata[0].get("NonecrmSourcePolicy"))
         if (delegation_snapshot() != superior_digest or secure_digest(POLICY, 16384, 0o600) != policy_digest
                 or committed_bootstrap(policy) != bootstrap_digest):
             raise ValueError("delegation changed during verification")

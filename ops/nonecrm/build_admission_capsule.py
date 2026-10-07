@@ -18,7 +18,8 @@ def build(tools, output):
     target = git("rev-parse", "HEAD")
     if git("status", "--porcelain") or git("rev-parse", "refs/remotes/origin/main") != target:
         raise ValueError("capsule requires clean latest canonical source")
-    verify_canonical(target)
+    snapshot = json.loads(subprocess.check_output(["gh", "api", "repos/DavidDreambular/hermes-agent/rulesets/24670342"], text=True))
+    verify_canonical(target, snapshot)
     entries = {"installer.py": (repo / "ops/nonecrm/hermes_admission_bootstrap.py").read_bytes(),
                "admission.py": (repo / "ops/nonecrm/hermes_admission.py").read_bytes(),
                "gh": (tools / "gh").read_bytes(), "trusted-root.jsonl": (tools / "trusted-root.jsonl").read_bytes()}
@@ -39,7 +40,7 @@ def build(tools, output):
                 info = tarfile.TarInfo(member)
                 info.size, info.mode, info.mtime = len(data), 0o600, 0
                 package.addfile(info, io.BytesIO(data))
-    with Path(str(path) + ".sha256").open("x") as checksum:
+    with Path(str(path) + ".sha256").open("x", encoding="utf-8") as checksum:
         checksum.write(f"{digest(path.read_bytes())}  {name}\n")
     print(f"Built bounded capsule source={target} sha256={digest(path.read_bytes())}")
 

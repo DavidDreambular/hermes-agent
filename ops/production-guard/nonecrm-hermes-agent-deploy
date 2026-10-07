@@ -145,6 +145,11 @@ def main():
     size = sum(p.lstat().st_size for p in home_source.rglob("*") if not p.is_symlink())
     if size > 268435456 or shutil.disk_usage("/opt").free < image["Size"] * 3 + size * 2 + 268435456:
         raise ValueError("preserved state/capacity budget exceeded")
+    if not legacy:
+        if old["State"].get("Paused"):
+            raise ValueError("predecessor already paused by another operation")
+        ATTEMPT["paused"] = old["Id"]
+        engine("POST", f"containers/{old['Id']}/pause")
     with tarfile.open(backup / "hermes-state.tar.gz", "x:gz") as archive:
         archive.add(home_source, arcname="home", recursive=True)
     descriptor = os.open(backup / "hermes-state.tar.gz", os.O_RDONLY | os.O_NOFOLLOW)
@@ -158,11 +163,18 @@ def main():
     for name in ["auth.json", "auth.json.lock"]:
         path = home_source / name
         if path.exists():
-            if path.is_symlink() or not path.is_file() or path.stat().st_uid != 10000:
-                raise ValueError("unsafe own Hermes auth state")
-            shutil.copyfile(path, home / name)
-            os.chmod(home / name, 0o600)
+            with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as auth:
+                info = os.fstat(auth.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != 10000 or info.st_nlink != 1 or info.st_size > 1_000_000:
+                    raise ValueError("unsafe own Hermes auth state")
+                data = auth.read(1_000_001)
+                if len(data) > 1_000_000:
+                    raise ValueError("own Hermes auth state grew")
+                write(home / name, data)
             os.chown(home / name, 10000, 10000)
+    if ATTEMPT.get("paused"):
+        engine("POST", f"containers/{old['Id']}/unpause")
+        ATTEMPT.pop("paused")
     profile = SOURCE / "ops/nonecrm/config.example.yaml"
     write(home / "config.yaml", profile.read_bytes() + b"\ncurator:\n  enabled: false\n", 0o640)
     os.chown(home / "config.yaml", 10000, 10000)
@@ -250,6 +262,14 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as error:
+        if ATTEMPT.get("paused"):
+            try:
+                paused = engine("GET", f"containers/{ATTEMPT['paused']}/json")
+                if paused["State"].get("Paused"):
+                    engine("POST", f"containers/{ATTEMPT['paused']}/unpause")
+                ATTEMPT.pop("paused")
+            except Exception:
+                print("Recorded predecessor pause could not be released; fixed recovery required", flush=True)
         transaction = ATTEMPT.get("transaction")
         if transaction and not transaction["traffic_committed"]:
             try:

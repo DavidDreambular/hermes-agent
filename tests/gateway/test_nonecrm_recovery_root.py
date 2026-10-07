@@ -14,7 +14,7 @@ import pytest
 
 
 @pytest.mark.linux_only
-@pytest.mark.parametrize("failure", [None, "signature", "candidate-exit", "rename", "journal", "probe", "exited-journal"])
+@pytest.mark.parametrize("failure", [None, "signature", "candidate-exit", "rename", "journal", "probe", "exited-journal", "live-success", "pause-response"])
 def test_isolated_fixed_recovery_transaction(failure):
     if os.geteuid() != 0 or socket.gethostname() != "MidPointsIA" or not Path("/.dockerenv").exists():
         pytest.skip("requires dedicated isolated Docker root fixture without host socket")
@@ -23,6 +23,10 @@ def test_isolated_fixed_recovery_transaction(failure):
     source = Path("/opt/production-sources/nonecrm-hermes-agent-source")
     assert not source.exists()
     target, expected = "a" * 40, "2bd1977d8fad185c9b4be47884f7e87f1add0ce3"
+    live = failure in {"live-success", "pause-response"}
+    failed = failure not in {None, "live-success"}
+    if live:
+        expected = "c" * 40
     old_id = "cf415bbe164a37938c9b655a112fba51150206818c1d1c7e4595c86fd090b2d0"
     old_image = "sha256:b2ee88947e66c349dbefeae5c6e1fd846d7b4d5f938fe2d3f04aeeecc09c11fc"
     image_id = "sha256:" + "b" * 64
@@ -60,8 +64,8 @@ def test_isolated_fixed_recovery_transaction(failure):
         Path(path).chmod(0o755)
     if not Path("/usr/bin/python3").exists():
         Path("/usr/bin/python3").symlink_to("/usr/local/bin/python3")
-    old = {"Id": old_id, "Name": "/nonecrm-hermes-agent", "Image": old_image, "State": {"Status": "exited", "Running": False},
-           "Config": {"Labels": {"org.opencontainers.image.revision": expected}}, "Mounts": []}
+    old = {"Id": old_id, "Name": "/nonecrm-hermes-agent", "Image": old_image, "State": {"Status": "running" if live else "exited", "Running": live},
+           "Config": {"Labels": {"org.opencontainers.image.revision": expected, "nonecrm.managed": "native-hermes-v1"}}, "Mounts": [{"Destination": "/opt/data", "Source": str(home)}]}
     operations, new = [], {}
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
@@ -101,11 +105,16 @@ def test_isolated_fixed_recovery_transaction(failure):
             elif "/networks/" in path:
                 new["NetworkSettings"]["Networks"]["nonecrm_nonecrm-network"] = {}
             elif path.endswith("/json"):
-                response = new if "new-id" in path or new.get("Name") == "/nonecrm-hermes-agent" else old
+                response = old if old_id in path else new if "new-id" in path or new.get("Name") == "/nonecrm-hermes-agent" else old
+            elif "/pause" in path or "/unpause" in path:
+                old["State"]["Paused"] = "/unpause" not in path
+                if failure == "pause-response" and old["State"]["Paused"]:
+                    return  # The effect happened, but the HTTP response is lost.
             elif "/stop" in path:
-                if not new["State"]["Running"]:
+                state = old["State"] if old_id in path else new["State"]
+                if not state["Running"]:
                     status = 304
-                new["State"]["Running"] = False
+                state["Running"] = False
             if response is not None:
                 encoded = json.dumps(response).encode()
             self.wfile.write(f"HTTP/1.1 {status} OK\r\nContent-Length: {len(encoded)}\r\nConnection: close\r\n\r\n".encode() + encoded)
@@ -115,18 +124,19 @@ def test_isolated_fixed_recovery_transaction(failure):
     program = Path(__file__).parents[2] / "ops/production-guard/nonecrm-hermes-agent-deploy"
     try:
         result = subprocess.run(["/bin/bash", str(program)], env={"PATH": "/usr/bin:/bin", "SERVICE": "nonecrm-hermes-agent", "ENVIRONMENT": "production", "TARGET_REVISION": target, "EXPECTED_REVISION": expected}, capture_output=True, text=True, timeout=20)
-        assert result.returncode == (1 if failure else 0), result.stdout + result.stderr
+        assert result.returncode == (1 if failed else 0), result.stdout + result.stderr
         assert (home / "history.txt").read_text() == "preserve-existing-state"
         assert "fixture-key" not in result.stdout + result.stderr
         exposed = any("/networks/" in path for _, path, _ in operations)
-        assert exposed is (failure is None)
-        if new and failure:
+        assert exposed is (not failed)
+        assert old["State"].get("Paused", False) is False
+        if new and failed:
             assert new["State"]["Running"] is False
             assert old["Name"] == "/nonecrm-hermes-agent"
-        if failure is None:
+        if not failed:
             transaction = json.loads((Path("/opt/apps/nonecrm-hermes-native") / target / "transaction.json").read_text())
             assert transaction["traffic_committed"] and transaction["phase"] == "private-ready"
-            assert transaction["old_runtime_usable"] is False
+            assert transaction["old_runtime_usable"] is live
             assert Path(transaction["backup"], "hermes-state.tar.gz").exists()
     finally:
         server.shutdown()

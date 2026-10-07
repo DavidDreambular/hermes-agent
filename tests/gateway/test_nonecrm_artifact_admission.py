@@ -95,6 +95,23 @@ def test_receipt_binds_verification_time_and_active_policy(monkeypatch):
     assert result["bootstrap_sha256"] == "e" * 64
 
 
+def test_anonymous_policy_requires_current_snapshot_after_signature_verification(monkeypatch):
+    module = component()
+    target = "a" * 40
+    policy = {"id": 24670342, "source": module.REPO, "updated_at": "2026-10-07T00:00:00Z", "enforcement": "active",
+              "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
+              "rules": [{"type": "deletion"}, {"type": "non_fast_forward"}, {"type": "pull_request", "parameters": module.PR_PARAMETERS}]}
+    monkeypatch.setattr(module, "source_json", lambda endpoint: {"protected": True, "commit": {"sha": target}} if endpoint == "branches/main" else policy)
+    module.verify_canonical(target, prepare=True)  # Creates staging only, never an admission receipt.
+    with pytest.raises(ValueError, match="signed current"):
+        module.verify_canonical(target)
+    snapshot = {**policy, "bypass_actors": []}
+    module.verify_canonical(target, snapshot)
+    policy["updated_at"] = "2026-10-08T00:00:00Z"
+    with pytest.raises(ValueError, match="signed current"):
+        module.verify_canonical(target, snapshot)
+
+
 def test_root_admit_real_signed_bundle_end_to_end(monkeypatch):
     fixture = Path("/signed-fixture")
     if os.geteuid() != 0 or not (fixture / "image.json").exists():
@@ -119,7 +136,12 @@ def test_root_admit_real_signed_bundle_end_to_end(monkeypatch):
     for path in [module.POLICY, module.DELEGATION, module.JOURNAL]:
         path.chmod(0o600)
     rules = [{"type": "deletion"}, {"type": "non_fast_forward"}, {"type": "pull_request", "parameters": module.PR_PARAMETERS}]
-    monkeypatch.setattr(module, "source_json", lambda endpoint: {"protected": True, "commit": {"sha": target}} if endpoint == "branches/main" else {"enforcement": "active", "bypass_actors": [], "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}}, "rules": rules})
+    public = {"enforcement": "active", "bypass_actors": [], "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}}, "rules": rules}
+    snapshot = json.loads((fixture / "image.json").read_text())[0].get("NonecrmSourcePolicy")
+    if snapshot:
+        public = {key: value for key, value in snapshot.items() if key not in {"bypass_actors", "current_user_can_bypass"}}
+        rules = public["rules"]
+    monkeypatch.setattr(module, "source_json", lambda endpoint: {"protected": True, "commit": {"sha": target}} if endpoint == "branches/main" else public)
     try:
         module.admit(target, prepare=True)
         stage = module.stage_path(target)
