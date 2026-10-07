@@ -46,6 +46,50 @@ jobs:
         run: |
           sudo env -i PATH="$PATH" HOME=/root HERMES_PYTHON="$PWD/.venv/bin/python" bash scripts/run_tests.sh -j 1 --file-retries 0 tests/gateway/test_nonecrm_admission_bootstrap.py tests/gateway/test_nonecrm_bootstrap_hardening.py
 
+  signed-admission:
+    needs: [tests, artifact]
+    if: always() && needs.tests.result == 'success' && github.repository == 'DavidDreambular/hermes-agent' && (github.ref != 'refs/heads/main' || needs.artifact.result == 'success') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Fetch genuine hosted main fixture and pinned public verifier
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir /tmp/signed-fixture /tmp/verifier-fixture
+          gh api repos/DavidDreambular/hermes-agent/rulesets/24670342 > /tmp/signed-fixture/source-policy.json
+          if [ "$GITHUB_REF" = refs/heads/main ]; then
+            run_id="$GITHUB_RUN_ID"
+          else
+            run_id="$(gh api 'repos/DavidDreambular/hermes-agent/actions/workflows/nonecrm-native-runtime.yml/runs?branch=main&event=push&status=success&per_page=1' --jq '.workflow_runs[0].id')"
+          fi
+          artifact_id="$(gh api "repos/DavidDreambular/hermes-agent/actions/runs/$run_id/artifacts" --jq '.artifacts[] | select(.expired == false and (.name | startswith("nonecrm-hermes-"))) | .id')"
+          [[ "$artifact_id" =~ ^[0-9]+$ ]]
+          gh api "repos/DavidDreambular/hermes-agent/actions/artifacts/$artifact_id/zip" > /tmp/signed-fixture.zip
+          python3 -c 'import zipfile,pathlib; z=zipfile.ZipFile("/tmp/signed-fixture.zip"); names={"image.tar.gz","image.json","attestation.json"}; assert len(z.infolist())==3 and set(z.namelist())==names; assert all(0<i.file_size<=1000000000 for i in z.infolist()); z.extractall("/tmp/signed-fixture")'
+          curl -fsSL --retry 3 https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_linux_amd64.tar.gz -o /tmp/verifier-fixture/gh.tar.gz
+          printf '%s  %s\n' bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386 /tmp/verifier-fixture/gh.tar.gz | sha256sum -c -
+          tar -xzf /tmp/verifier-fixture/gh.tar.gz -C /tmp/verifier-fixture gh_2.102.0_linux_amd64/bin/gh
+          install -m 0755 /tmp/verifier-fixture/gh_2.102.0_linux_amd64/bin/gh /tmp/verifier-fixture/gh
+          env -i HOME=/tmp/verifier-fixture PATH=/usr/bin:/bin /tmp/verifier-fixture/gh attestation trusted-root > /tmp/verifier-fixture/trusted-root.jsonl
+          printf '%s  %s\n' 7469124f706944133d6a169691dd1c6c3511b12e85878d255e044e2948df4c9b /tmp/verifier-fixture/gh 65ca537f6ed8a47fd0e560c421baa1f6c1efb8b25fc200d8c5c02c0e92eb2b9c /tmp/verifier-fixture/trusted-root.jsonl | sha256sum -c -
+      - name: Execute real admission in isolated root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 -f ops/nonecrm/Dockerfile --build-arg SOURCE_REVISION="$GITHUB_SHA" -t nonecrm-hermes:admission-fixture .
+          docker run --rm --hostname MidPointsIA --user 0 --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --security-opt no-new-privileges \
+            --mount type=bind,src="$PWD",dst=/source,readonly --mount type=bind,src=/tmp/signed-fixture,dst=/signed-fixture,readonly --mount type=bind,src=/tmp/verifier-fixture,dst=/verifier-fixture,readonly \
+            --entrypoint /bin/bash nonecrm-hermes:admission-fixture -c 'set -euo pipefail; /usr/local/bin/python -m pip --python /opt/hermes/.venv/bin/python install pytest==8.4.2 pytest-asyncio==1.2.0 pytest-timeout==2.4.0 >/dev/null; mkdir /root/repo; cp -r /source/scripts /source/tests /source/ops /source/pyproject.toml /root/repo/; HOME=/root HERMES_PYTHON=/opt/hermes/.venv/bin/python HERMES_TEST_FILE_RETRIES=0 /root/repo/scripts/run_tests.sh -j 1 tests/gateway/test_nonecrm_artifact_admission.py tests/gateway/test_nonecrm_recovery_root.py'
+
   artifact:
     needs: tests
     if: github.repository == 'DavidDreambular/hermes-agent' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
@@ -99,6 +143,6 @@ jobs:
         with:
           name: nonecrm-hermes-${{ github.sha }}
           path: release/
-          retention-days: 1
+          retention-days: 90
           compression-level: 0
           if-no-files-found: error

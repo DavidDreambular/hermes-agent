@@ -131,7 +131,14 @@ def install(authorization, package_sha):
     if manifest["gh"] != GH_SHA or manifest["trusted-root.jsonl"] != ROOTS_SHA:
         raise ValueError("unapproved signature verifier or trust roots")
     policy = json.loads((payload / "policy.json").read_text(encoding="utf-8"))
-    if policy != {"schema": 1, "enabled": True, "service": "nonecrm-hermes-agent",
+    snapshot = policy.get("source_policy_snapshot")
+    if (not isinstance(snapshot, dict) or snapshot.get("id") != 24670342
+            or snapshot.get("source") != "DavidDreambular/hermes-agent" or snapshot.get("bypass_actors") != []
+            or snapshot.get("enforcement") != "active" or not snapshot.get("updated_at")
+            or snapshot.get("conditions", {}).get("ref_name") != {"include": ["refs/heads/main"], "exclude": []}
+            or {item.get("type") for item in snapshot.get("rules", [])} != {"pull_request", "deletion", "non_fast_forward"}):
+        raise ValueError("invalid bounded owner source-policy observation")
+    if {key: value for key, value in policy.items() if key != "source_policy_snapshot"} != {"schema": 1, "enabled": True, "service": "nonecrm-hermes-agent",
                   "repository": "DavidDreambular/hermes-agent", "gh_sha256": GH_SHA,
                   "roots_sha256": ROOTS_SHA, "admission_sha256": manifest["admission.py"]}:
         raise ValueError("package attempts to expand delegated scope")

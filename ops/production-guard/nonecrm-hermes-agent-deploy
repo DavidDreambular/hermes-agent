@@ -107,8 +107,19 @@ def main():
             raise ValueError("legacy container/config compare-and-swap failed")
         if (STATE / f"{SERVICE}--production.env").exists():
             raise ValueError("legacy release manifest expected absent")
-    elif old["Config"].get("Labels", {}).get("nonecrm.managed") != "native-hermes-v1" or not old["State"]["Running"]:
-        raise ValueError("unsupported existing runtime")
+    else:
+        # This initial fixed capability recovers the observed stopped legacy
+        # service only. Never fork a live rotating OAuth/state store.
+        if (expected == target and old["Config"].get("Labels", {}).get("nonecrm.managed") == "native-hermes-v1"
+                and old["State"].get("Running") and old["State"].get("Health", {}).get("Status") == "healthy"):
+            run("/usr/local/libexec/production-guard/hermes-artifact-admit", "admit", target)
+            receipt_path = STATE / "hermes-artifacts" / target / "admitted.json"
+            secure(receipt_path)
+            if json.loads(receipt_path.read_text())["image"] != old["Image"]:
+                raise ValueError("unchanged runtime differs from independently admitted image")
+            print(f"Verified unchanged native runtime source={target}; no state/auth fork or runtime mutation")
+            return
+        raise ValueError("native upgrades require a separately reviewed fixed capability")
     # Fresh verification is deliberately repeated under the guard's service lock.
     run("/usr/local/libexec/production-guard/hermes-artifact-admit", "admit", target)
     stage = STATE / "hermes-artifacts" / target
@@ -158,10 +169,14 @@ def main():
     for name in ["auth.json", "auth.json.lock"]:
         path = home_source / name
         if path.exists():
-            if path.is_symlink() or not path.is_file() or path.stat().st_uid != 10000:
-                raise ValueError("unsafe own Hermes auth state")
-            shutil.copyfile(path, home / name)
-            os.chmod(home / name, 0o600)
+            with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as auth:
+                info = os.fstat(auth.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != 10000 or info.st_nlink != 1 or info.st_size > 1_000_000:
+                    raise ValueError("unsafe own Hermes auth state")
+                data = auth.read(1_000_001)
+                if len(data) > 1_000_000:
+                    raise ValueError("own Hermes auth state grew")
+                write(home / name, data)
             os.chown(home / name, 10000, 10000)
     profile = SOURCE / "ops/nonecrm/config.example.yaml"
     write(home / "config.yaml", profile.read_bytes() + b"\ncurator:\n  enabled: false\n", 0o640)
@@ -228,15 +243,14 @@ print("HERMES_PROBE="+json.dumps({"provider":provider,"model":model,"disk_status
     if current["Id"] != old["Id"] or current["Image"] != old["Image"]:
         raise ValueError("runtime changed before cutover")
     # Preserve broken legacy metadata through Docker's own API; never edit its store.
-    if not legacy:
-        engine("POST", f"containers/{old['Id']}/stop?t=30")
     engine("POST", f"containers/{old['Id']}/rename?name={SERVICE}-preserved-{expected[:12]}")
     engine("POST", f"containers/{new_id}/rename?name={SERVICE}")
     # Commit the journal BEFORE network exposure. After this point never rewind
     # the new home or delete new data, even if a later functional gate fails.
     transaction["phase"] = "traffic-committing"
-    write(journal, json.dumps(transaction).encode())
     transaction["traffic_committed"] = True
+    write(journal, json.dumps(transaction).encode())
+    ATTEMPT["exposure_attempted"] = True
     engine("POST", f"networks/{NETWORK}/connect", {"Container": new_id, "EndpointConfig": {"Aliases": [SERVICE]}})
     final = engine("GET", f"containers/{SERVICE}/json")
     if final["Image"] != image_id or not final["State"]["Running"] or NETWORK not in final["NetworkSettings"]["Networks"]:
@@ -251,7 +265,7 @@ if __name__ == "__main__":
         main()
     except Exception as error:
         transaction = ATTEMPT.get("transaction")
-        if transaction and not transaction["traffic_committed"]:
+        if transaction and not ATTEMPT.get("exposure_attempted"):
             try:
                 engine("POST", f"containers/{transaction['new_id']}/stop?t=10", stopped_ok=True)
                 candidate_state = engine("GET", f"containers/{transaction['new_id']}/json")
@@ -263,6 +277,7 @@ if __name__ == "__main__":
                 if ATTEMPT["old"]["State"]["Running"] and not old["State"]["Running"]:
                     engine("POST", f"containers/{old['Id']}/start")
                 transaction["phase"] = "failed-pretraffic-preserved"
+                transaction["traffic_committed"] = False
                 write(ATTEMPT["journal"], json.dumps(transaction).encode())
             except Exception:
                 print("Pretraffic rollback incomplete; preserve journal/state and require fixed recovery", flush=True)
