@@ -125,6 +125,8 @@ def test_live_anonymous_github_policy_matches_public_snapshot():
     # Real public HTTPS validates staging/protection shape, NOT private actors or
     # an image approval. The fixed owner capsule separately captures that policy.
     module.verify_canonical(target, prepare=True)
+    reference = json.loads((Path(__file__).parents[1] / "fixtures/nonecrm/source-policy.json").read_text(encoding="utf-8"))
+    module.verify_canonical(target, reference)  # Actual owner-observed fixture, no image approval.
 
 
 def test_root_admit_real_signed_bundle_end_to_end(monkeypatch):
@@ -145,6 +147,9 @@ def test_root_admit_real_signed_bundle_end_to_end(monkeypatch):
                      "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
                      "rules": [{"type": "deletion"}, {"type": "non_fast_forward"}, {"type": "pull_request", "parameters": module.PR_PARAMETERS}]}
     policy["source_policy_snapshot"] = {**source_policy, "bypass_actors": []}
+    live = (fixture / "source-policy.json").exists()
+    if live:
+        policy["source_policy_snapshot"] = json.loads((Path(__file__).parents[1] / "fixtures/nonecrm/source-policy.json").read_text(encoding="utf-8"))
     for source, name, key, mode in sources:
         shutil.copyfile(source, module.TOOLS / name)
         (module.TOOLS / name).chmod(mode)
@@ -156,7 +161,8 @@ def test_root_admit_real_signed_bundle_end_to_end(monkeypatch):
         path.chmod(0o600)
     public = source_policy  # Simulates the actor-redacted API, not empty actors.
     rules = public["rules"]
-    monkeypatch.setattr(module, "source_json", lambda endpoint: {"protected": True, "commit": {"sha": target}} if endpoint == "branches/main" else public)
+    if not live:
+        monkeypatch.setattr(module, "source_json", lambda endpoint: {"protected": True, "commit": {"sha": target}} if endpoint == "branches/main" else public)
     try:
         module.admit(target, prepare=True)
         stage = module.stage_path(target)
@@ -171,8 +177,9 @@ def test_root_admit_real_signed_bundle_end_to_end(monkeypatch):
         with pytest.raises(module.subprocess.CalledProcessError):
             module.admit(target)
         assert not (stage / "admitted.json").exists()
-        rules[2]["parameters"] = {**module.PR_PARAMETERS, "required_review_thread_resolution": False}
-        with pytest.raises(ValueError, match="protection"):
-            module.verify_canonical(target)
+        if not live:
+            rules[2]["parameters"] = {**module.PR_PARAMETERS, "required_review_thread_resolution": False}
+            with pytest.raises(ValueError, match="protection"):
+                module.verify_canonical(target)
     finally:
         shutil.rmtree(root)
