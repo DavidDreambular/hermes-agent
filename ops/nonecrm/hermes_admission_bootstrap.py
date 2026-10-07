@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import socket
 import stat
+import tarfile
 import tempfile
 
 EXPECTED = {
@@ -49,7 +50,10 @@ def parents_safe(path):
 
 def atomic_bytes(path, data, mode):
     parents_safe(path)
-    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    for directory in reversed([path.parent, *path.parent.parents]):
+        if not directory.exists():
+            directory.mkdir(mode=0o755)
+            sync_directory(directory.parent)
     descriptor, temporary = tempfile.mkstemp(prefix=".hermes-bootstrap-", dir=path.parent)
     try:
         with os.fdopen(descriptor, "wb") as output:
@@ -111,6 +115,19 @@ def install(authorization, package_sha):
         raise ValueError("package contains unapproved entries")
     if any(digest(payload / name) != expected for name, expected in manifest.items()):
         raise ValueError("package contents changed")
+    archive = payload.parent / "hermes-admission-v1-midpoints-vps.tar.gz"
+    root_regular(archive, 0o600)
+    if digest(archive) != package_sha:
+        raise ValueError("package archive compare-and-swap failed")
+    with tarfile.open(archive, "r:gz") as package:
+        members = package.getmembers()
+        if len(members) != len(allowed) or {item.name for item in members} != allowed:
+            raise ValueError("unexpected capsule members")
+        for item in members:
+            if not item.isfile() or not 0 < item.size <= 100_000_000:
+                raise ValueError("unsafe capsule member")
+            if package.extractfile(item).read() != (payload / item.name).read_bytes():
+                raise ValueError("extracted capsule differs from pinned archive")
     if manifest["gh"] != GH_SHA or manifest["trusted-root.jsonl"] != ROOTS_SHA:
         raise ValueError("unapproved signature verifier or trust roots")
     policy = json.loads((payload / "policy.json").read_text(encoding="utf-8"))
@@ -130,6 +147,7 @@ def install(authorization, package_sha):
         state = STATE
         parents_safe(state)
         state.mkdir(mode=0o700, exist_ok=True)
+        sync_directory(state.parent)
         info = state.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
             raise ValueError("unsafe admission state")
@@ -143,6 +161,7 @@ def install(authorization, package_sha):
             root_regular(path, 0o600 if name.endswith(".conf") else 0o755)
             if digest(path) != expected:
                 raise ValueError("installed guard compare-and-swap failed")
+        old = {}
         if JOURNAL.exists() or JOURNAL.is_symlink():
             root_regular(JOURNAL, 0o600)
             old = json.loads(JOURNAL.read_text(encoding="utf-8"))
@@ -160,6 +179,9 @@ def install(authorization, package_sha):
                     raise ValueError("existing admission component differs")
             else:
                 missing.append(name)
+        if not missing and old.get("phase") == "committed" and old.get("manifest") == manifest and old.get("package") == package_sha:
+            print("Bounded Hermes admission already committed; no activation state changed.")
+            return
         transaction = {"phase": "installing", "package": package_sha, "manifest": manifest, "created": missing}
         atomic_bytes(JOURNAL, json.dumps(transaction, sort_keys=True).encode(), 0o600)
         audit = AUDIT
