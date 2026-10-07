@@ -1,0 +1,30 @@
+# Non-secret profile for the existing Hermes agent and native API server.
+# Apply through the registered deployment operation; preserve the prior profile.
+model:
+  provider: openai-codex
+  default: gpt-6-luna
+  openai_runtime: auto
+
+fallback_providers:
+  - provider: openrouter
+    model: openai/gpt-6-luna
+
+agent:
+  max_iterations: 8
+  disabled_toolsets:
+    - bfl
+
+platform_toolsets:
+  api_server:
+    - skills
+    - todo
+    - no_mcp
+
+gateway:
+  api_server:
+    enabled: true
+    # Container-private network only. Do not publish this port on the host.
+    host: 0.0.0.0
+    port: 8642
+    model_name: hermes-agent
+    max_concurrent_runs: 1
