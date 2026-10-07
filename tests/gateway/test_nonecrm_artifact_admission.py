@@ -79,3 +79,12 @@ def test_excluded_canonical_branch_cannot_pass_protection(monkeypatch):
                         "rules": [{"type": name} for name in ["pull_request", "deletion", "non_fast_forward"]]})
     with pytest.raises(ValueError):
         module.verify_canonical(target)
+
+
+def test_receipt_binds_verification_time_and_active_policy(monkeypatch):
+    module = component()
+    monkeypatch.setattr(module.time, "time", lambda: 123456)
+    result = module.receipt_data("a" * 40, "sha256:" + "b" * 64, {"image.json": "c" * 64}, "d" * 64, "e" * 64)
+    assert result["verified_at"] == 123456
+    assert result["policy_sha256"] == "d" * 64
+    assert result["bootstrap_sha256"] == "e" * 64

@@ -11,6 +11,7 @@ import socket
 import stat
 import subprocess
 import tempfile
+import time
 import urllib.request
 
 REPO = "DavidDreambular/hermes-agent"
@@ -147,6 +148,12 @@ def committed_bootstrap(policy):
     return digest
 
 
+def receipt_data(target, image_id, hashes, policy_digest, bootstrap_digest):
+    return {"source": target, "image": image_id, "hashes": hashes, "repository": REPO,
+            "verified_by": "github-sigstore-hosted-build", "workflow": WORKFLOW,
+            "verified_at": int(time.time()), "policy_sha256": policy_digest, "bootstrap_sha256": bootstrap_digest}
+
+
 def admit(target, prepare=False):
     if os.geteuid() != 0 or socket.gethostname() != "MidPointsIA":
         raise ValueError("installed admission requires root")
@@ -189,8 +196,7 @@ def admit(target, prepare=False):
         if (delegation_snapshot() != superior_digest or secure_digest(POLICY, 16384, 0o600) != policy_digest
                 or committed_bootstrap(policy) != bootstrap_digest):
             raise ValueError("delegation changed during verification")
-        receipt = {"source": target, "image": image_id, "hashes": hashes, "repository": REPO,
-                   "verified_by": "github-sigstore-hosted-build", "workflow": WORKFLOW}
+        receipt = receipt_data(target, image_id, hashes, policy_digest, bootstrap_digest)
         descriptor, temporary = tempfile.mkstemp(prefix=".receipt-", dir=stage)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(receipt, stream, sort_keys=True)
