@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tarfile
@@ -19,8 +20,9 @@ def build(tools, output):
     if git("status", "--porcelain") or git("rev-parse", "refs/remotes/origin/main") != target:
         raise ValueError("capsule requires clean latest canonical source")
     verify_canonical(target)
-    entries = {"installer.py": (repo / "ops/nonecrm/hermes_admission_bootstrap.py").read_bytes(),
-               "admission.py": (repo / "ops/nonecrm/hermes_admission.py").read_bytes(),
+    source = lambda name: subprocess.check_output(["git", "-C", str(repo), "show", f"{target}:ops/nonecrm/{name}"])
+    entries = {"installer.py": source("hermes_admission_bootstrap.py"),
+               "admission.py": source("hermes_admission.py"),
                "gh": (tools / "gh").read_bytes(), "trusted-root.jsonl": (tools / "trusted-root.jsonl").read_bytes()}
     digest = lambda data: hashlib.sha256(data).hexdigest()
     if digest(entries["gh"]) != GH_SHA or digest(entries["trusted-root.jsonl"]) != ROOTS_SHA:
@@ -34,6 +36,7 @@ def build(tools, output):
     if path.exists() or path.is_symlink():
         raise ValueError("preserve existing capsule; do not overwrite")
     with path.open("xb") as archive:
+        os.fchmod(archive.fileno(), 0o600)
         with tarfile.open(fileobj=archive, mode="w:gz") as package:
             for member, data in entries.items():
                 info = tarfile.TarInfo(member)
