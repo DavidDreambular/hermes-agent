@@ -53,7 +53,10 @@ def fixture(monkeypatch):
     monkeypatch.setattr(module, "GH_SHA", sha("gh"))
     monkeypatch.setattr(module, "ROOTS_SHA", sha("trusted-root.jsonl"))
     policy = {"schema": 1, "enabled": True, "service": "nonecrm-hermes-agent", "repository": "DavidDreambular/hermes-agent",
-              "gh_sha256": sha("gh"), "roots_sha256": sha("trusted-root.jsonl"), "admission_sha256": sha("admission.py")}
+              "gh_sha256": sha("gh"), "roots_sha256": sha("trusted-root.jsonl"), "admission_sha256": sha("admission.py"),
+              "source_policy_snapshot": {"id": 24670342, "source": "DavidDreambular/hermes-agent", "enforcement": "active",
+                  "bypass_actors": [], "updated_at": "2026-10-07T00:00:00Z", "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
+                  "rules": [{"type": name} for name in ["pull_request", "deletion", "non_fast_forward"]]}}
     (payload / "policy.json").write_text(json.dumps(policy))
     manifest = {name: sha(name) for name in ["installer.py", *destinations]}
     (payload / "manifest.json").write_text(json.dumps(manifest))

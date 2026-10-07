@@ -52,7 +52,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
-      contents: write # Read the restricted bypass field for the live-shape integration fixture.
+      contents: read
       actions: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -96,7 +96,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
-      contents: write # GitHub only discloses bypass actors to repository writers.
+      contents: read
       id-token: write
       attestations: write
     steps:
@@ -116,12 +116,6 @@ jobs:
           mkdir release
           docker image inspect nonecrm-hermes:verified > release/image.json
           docker save nonecrm-hermes:verified | gzip -1 > release/image.tar.gz
-      - name: Bind live source protection into signed metadata
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api repos/DavidDreambular/hermes-agent/rulesets/24670342 > /tmp/source-policy.json
-          python3 -c 'import json,pathlib; p=json.load(open("/tmp/source-policy.json")); assert p.get("id")==24670342 and p.get("bypass_actors")==[] and p.get("enforcement")=="active"; f=pathlib.Path("release/image.json"); m=json.loads(f.read_text()); m[0]["NonecrmSourcePolicy"]=p; f.write_text(json.dumps(m),encoding="utf-8")'
       - name: Verify fixed recovery in isolated root container
         shell: bash
         run: |

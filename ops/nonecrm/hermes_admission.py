@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Fixed, independently signed artifact admission; never imports or deploys images."""
 import argparse
+from datetime import datetime
 import fcntl
 import hashlib
 import json
@@ -123,13 +124,17 @@ def verify_canonical(target, policy_snapshot=None, prepare=False):
     if bypass is not None and bypass != []:
         raise ValueError("canonical source bypass changed")
     if bypass is None and not prepare:
-        # Anonymous GitHub reads omit bypass actors. A genuinely signed build
-        # snapshot plus the public live ruleset revision closes that read gap.
+        # The fixed owner bootstrap captures restricted actor data with existing
+        # local owner authentication. No credential or image approval is stored.
         if (not isinstance(policy_snapshot, dict) or policy_snapshot.get("id") != 24670342
                 or policy_snapshot.get("bypass_actors") != [] or not ruleset.get("updated_at")
                 or any(policy_snapshot.get(key) != ruleset.get(key) for key in
-                       ["updated_at", "enforcement", "conditions", "rules", "source"])):
-            raise ValueError("signed current source-policy snapshot required")
+                       ["enforcement", "conditions", "rules", "source"])):
+            raise ValueError("current root-owned source-policy snapshot required")
+        observed = datetime.fromisoformat(str(policy_snapshot.get("updated_at", "")).replace("Z", "+00:00"))
+        current = datetime.fromisoformat(ruleset["updated_at"].replace("Z", "+00:00"))
+        if observed.tzinfo is None or current.tzinfo is None or observed != current:
+            raise ValueError("source policy revision changed since owner bootstrap")
 
 
 def validate_delegation(text):
@@ -210,7 +215,7 @@ def admit(target, prepare=False):
             raise ValueError("artifact changed during verification")
         metadata = json.loads((stage / "image.json").read_text(encoding="utf-8"))
         image_id = validate_image(metadata, target)
-        verify_canonical(target, metadata[0].get("NonecrmSourcePolicy"))
+        verify_canonical(target, policy.get("source_policy_snapshot"))
         if (delegation_snapshot() != superior_digest or secure_digest(POLICY, 16384, 0o600) != policy_digest
                 or committed_bootstrap(policy) != bootstrap_digest):
             raise ValueError("delegation changed during verification")
