@@ -1,0 +1,271 @@
+#!/bin/bash
+# Fixed one-service program. The installed onboarding/core runner owns the service lock.
+set -euo pipefail
+export PATH=/usr/bin:/bin
+exec /usr/bin/python3 -I - "$@" <<'PY'
+import fcntl
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import stat
+import subprocess
+import tarfile
+import time
+import urllib.parse
+
+SERVICE = "nonecrm-hermes-agent"
+OLD_ID = "cf415bbe164a37938c9b655a112fba51150206818c1d1c7e4595c86fd090b2d0"
+OLD_IMAGE = "sha256:b2ee88947e66c349dbefeae5c6e1fd846d7b4d5f938fe2d3f04aeeecc09c11fc"
+OLD_SOURCE = "2bd1977d8fad185c9b4be47884f7e87f1add0ce3"
+OLD_HOME = Path("/var/lib/docker/volumes/1abf8bf156c0b133516d33681e3088327c993b670b773e608a729cc77194fe1e/_data")
+SOURCE = Path("/opt/production-sources/nonecrm-hermes-agent-source")
+ROOT = Path("/opt/apps/nonecrm-hermes-native")
+NETWORK = "nonecrm_nonecrm-network"
+STATE = Path("/var/lib/production-guard")
+ATTEMPT = {}
+
+
+class Engine(http.client.HTTPConnection):
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(120)
+        self.sock.connect("/var/run/docker.sock")
+
+
+def engine(method, path, body=None, raw_output=False, stopped_ok=False):
+    connection = Engine("localhost")
+    data = json.dumps(body).encode() if body is not None else None
+    connection.request(method, "/v1.47/" + path, data, {"Content-Type": "application/json"})
+    response = connection.getresponse()
+    raw = response.read(2_000_000)
+    status = response.status
+    connection.close()
+    if status >= 300 and not (stopped_ok and status == 304 and method == "POST" and "/stop?" in path):
+        raise RuntimeError(f"fixed engine operation failed: {method} {path.split('?')[0]} status={status}")
+    return raw if raw_output else json.loads(raw) if raw else None
+
+
+def secure(path, directory=False):
+    for parent in path.parents:
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError("unsafe protected parent")
+    info = path.lstat()
+    if (not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
+            or info.st_uid != 0 or info.st_mode & 0o022 or not directory and info.st_nlink != 1):
+        raise ValueError("unsafe protected file")
+
+
+def digest(path):
+    secure(path)
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def write(path, value, mode=0o600):
+    temporary = path.with_name(path.name + ".new")
+    with temporary.open("xb") as stream:
+        stream.write(value)
+        stream.flush()
+        os.fchmod(stream.fileno(), mode)
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    descriptor = os.open(path.parent, os.O_DIRECTORY | os.O_NOFOLLOW)
+    os.fsync(descriptor)
+    os.close(descriptor)
+
+
+def run(*args):
+    return subprocess.check_output(args, env={"PATH": "/usr/bin:/bin", "HOME": "/root"}, text=True).strip()
+
+
+def main():
+    os.umask(0o077)
+    if os.geteuid() != 0 or socket.gethostname() != "MidPointsIA" or os.environ.get("SERVICE") != SERVICE or os.environ.get("ENVIRONMENT") != "production":
+        raise ValueError("fixed service/host identity required")
+    target = os.environ.get("TARGET_REVISION", "")
+    expected = os.environ.get("EXPECTED_REVISION", "")
+    if not re.fullmatch(r"[0-9a-f]{40}", target) or not re.fullmatch(r"[0-9a-f]{40}", expected):
+        raise ValueError("exact source revisions required")
+    secure(SOURCE, True)
+    if run("git", "-C", str(SOURCE), "rev-parse", "HEAD") != target or run("git", "-C", str(SOURCE), "status", "--porcelain"):
+        raise ValueError("canonical source changed")
+    run("git", "-C", str(SOURCE), "merge-base", "--is-ancestor", expected, target)
+    secure(Path("/run/production-guard") / f"{SERVICE}--production.active")
+    config_path = Path("/etc/production-guard/services.d") / f"{SERVICE}--production.conf"
+    old = engine("GET", f"containers/{SERVICE}/json")
+    if old["Config"].get("Labels", {}).get("org.opencontainers.image.revision") != expected:
+        raise ValueError("runtime source compare-and-swap failed")
+    legacy = expected == OLD_SOURCE
+    if legacy:
+        if old["Id"] != OLD_ID or old["Image"] != OLD_IMAGE or old["State"]["Status"] != "exited" or digest(config_path) != "233f3142744224c04dabe408629d7927b82d8d0443656913a770fa01454d2e15":
+            raise ValueError("legacy container/config compare-and-swap failed")
+        if (STATE / f"{SERVICE}--production.env").exists():
+            raise ValueError("legacy release manifest expected absent")
+    elif old["Config"].get("Labels", {}).get("nonecrm.managed") != "native-hermes-v1" or not old["State"]["Running"]:
+        raise ValueError("unsupported existing runtime")
+    # Fresh verification is deliberately repeated under the guard's service lock.
+    run("/usr/local/libexec/production-guard/hermes-artifact-admit", "admit", target)
+    stage = STATE / "hermes-artifacts" / target
+    admission_lock = os.open(stage.parent / ".admission.lock", os.O_RDWR | os.O_NOFOLLOW)
+    fcntl.flock(admission_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    receipt = json.loads((stage / "admitted.json").read_text())
+    secure(stage / "admitted.json")
+    if receipt.get("source") != target or receipt.get("repository") != "DavidDreambular/hermes-agent" or receipt.get("verified_by") != "github-sigstore-hosted-build":
+        raise ValueError("independent admission receipt mismatch")
+    if not 0 <= time.time() - receipt.get("verified_at", 0) <= 120:
+        raise ValueError("fresh independent admission required")
+    if receipt.get("policy_sha256") != digest(Path("/etc/production-guard/hermes-admission.json")) or receipt.get("bootstrap_sha256") != digest(STATE / "hermes-bootstrap-transaction.json"):
+        raise ValueError("admission policy changed before import")
+    for name in ["image.tar.gz", "image.json", "attestation.json"]:
+        if digest(stage / name) != receipt["hashes"][name]:
+            raise ValueError("admitted artifact changed")
+    image = json.loads((stage / "image.json").read_text())[0]
+    image_id = receipt["image"]
+    if image["Id"] != image_id or shutil.disk_usage("/opt").free < image["Size"] * 3 + 268435456:
+        raise ValueError("image identity/capacity gate failed")
+    ROOT.mkdir(mode=0o700, exist_ok=True)
+    secure(ROOT, True)
+    release = ROOT / target
+    if release.exists() or release.is_symlink():
+        raise ValueError("prior attempt retained; fixed recovery review required")
+    release.mkdir(mode=0o700)
+    backup = release / "backup"
+    backup.mkdir(mode=0o700)
+    write(backup / "old-container.json", json.dumps(old, sort_keys=True).encode())
+    write(backup / "service.conf", config_path.read_bytes())
+    home_source = OLD_HOME if legacy else Path(next(m["Source"] for m in old["Mounts"] if m["Destination"] == "/opt/data"))
+    if home_source.is_symlink() or not home_source.is_dir() or home_source.stat().st_uid != 10000:
+        raise ValueError("unexpected Hermes state")
+    size = sum(p.lstat().st_size for p in home_source.rglob("*") if not p.is_symlink())
+    if size > 268435456 or shutil.disk_usage("/opt").free < image["Size"] * 3 + size * 2 + 268435456:
+        raise ValueError("preserved state/capacity budget exceeded")
+    with tarfile.open(backup / "hermes-state.tar.gz", "x:gz") as archive:
+        archive.add(home_source, arcname="home", recursive=True)
+    descriptor = os.open(backup / "hermes-state.tar.gz", os.O_RDONLY | os.O_NOFOLLOW)
+    os.fsync(descriptor)
+    os.close(descriptor)
+    write(backup / "state.sha256", (digest(backup / "hermes-state.tar.gz") + "\n").encode())
+    # Preserve every old state byte in the verified backup. Start a dedicated own
+    # home, not inherited executable plugins, cron schedules or another app auth.
+    home = release / "home"
+    home.mkdir(mode=0o700)
+    for name in ["auth.json", "auth.json.lock"]:
+        path = home_source / name
+        if path.exists():
+            if path.is_symlink() or not path.is_file() or path.stat().st_uid != 10000:
+                raise ValueError("unsafe own Hermes auth state")
+            shutil.copyfile(path, home / name)
+            os.chmod(home / name, 0o600)
+            os.chown(home / name, 10000, 10000)
+    profile = SOURCE / "ops/nonecrm/config.example.yaml"
+    write(home / "config.yaml", profile.read_bytes() + b"\ncurator:\n  enabled: false\n", 0o640)
+    os.chown(home / "config.yaml", 10000, 10000)
+    os.chown(home, 10000, 10000)
+    # Values stay only on the host/in Docker; never print or export them.
+    app = engine("GET", "containers/nonecrm-app/json")
+    values = dict(item.split("=", 1) for item in app["Config"]["Env"] if "=" in item)
+    if not values.get("HERMES_AGENT_API_KEY") or not values.get("OPENROUTER_API_KEY"):
+        raise ValueError("same-service API/fallback credentials unavailable")
+    env = ["API_SERVER_KEY=" + values["HERMES_AGENT_API_KEY"], "OPENROUTER_API_KEY=" + values["OPENROUTER_API_KEY"]]
+    # Loading is possible only after independent admission; no handwritten approval.
+    with (stage / "image.tar.gz").open("rb") as stream:
+        subprocess.run(["/usr/bin/docker", "image", "load"], stdin=stream, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=180)
+    loaded = engine("GET", "images/" + image_id + "/json")
+    if loaded["Id"] != image_id or loaded["Config"].get("Labels", {}).get("org.opencontainers.image.revision") != target:
+        raise ValueError("loaded image differs from signed identity")
+    candidate = SERVICE + "-candidate-" + target[:12]
+    journal = release / "transaction.json"
+    transaction = {"phase": "prepared", "target": target, "old_id": old["Id"], "new_id": None,
+                   "old_runtime_usable": not legacy, "backup": str(backup), "traffic_committed": False}
+    write(journal, json.dumps(transaction).encode())
+    created = engine("POST", "containers/create?name=" + candidate, {
+        "Image": image_id, "Env": env, "Labels": {"org.opencontainers.image.revision": target, "nonecrm.managed": "native-hermes-v1"},
+        "HostConfig": {"Binds": [str(home) + ":/opt/data:rw", "/opt/nonecrm-hermes-agent:/data:ro"],
+                       "NetworkMode": "bridge", "CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges"],
+                       "Memory": 536870912, "PidsLimit": 128, "RestartPolicy": {"Name": "unless-stopped"}},
+        "Healthcheck": {"Test": ["CMD", "/opt/hermes/.venv/bin/python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8642/health',timeout=3)"],
+                        "Interval": 5000000000, "Timeout": 4000000000, "Retries": 12, "StartPeriod": 30000000000}})
+    new_id = created["Id"]
+    transaction["new_id"] = new_id
+    ATTEMPT.update(journal=journal, transaction=transaction, old=old)
+    write(journal, json.dumps(transaction).encode())
+    engine("POST", f"containers/{new_id}/start")
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        state = engine("GET", f"containers/{new_id}/json")["State"]
+        if not state["Running"]:
+            raise RuntimeError("candidate exited before private cutover; old container/state preserved")
+        if state.get("Health", {}).get("Status") == "healthy":
+            break
+        time.sleep(2)
+    else:
+        raise RuntimeError("candidate readiness failed; old container/state preserved")
+    probe = '''import json,os,urllib.request
+from gateway.run import _resolve_runtime_agent_kwargs,_resolve_gateway_model
+r=_resolve_runtime_agent_kwargs();provider=r.get("provider");model=r.get("model") or _resolve_gateway_model()
+assert (provider,model) in [("openai-codex","gpt-6-luna"),("openrouter","openai/gpt-6-luna")]
+request=urllib.request.Request("http://127.0.0.1:8642/health/detailed",headers={"Authorization":"Bearer "+os.environ["API_SERVER_KEY"]})
+health=json.load(urllib.request.urlopen(request,timeout=5));checks=health["readiness"]["checks"]
+assert all(value["status"]=="ok" for key,value in checks.items() if key!="disk")
+assert checks["disk"]["free_bytes"]>=268435456
+print("HERMES_PROBE="+json.dumps({"provider":provider,"model":model,"disk_status":checks["disk"]["status"]}))'''
+    execution = engine("POST", f"containers/{new_id}/exec", {"AttachStdout": True, "AttachStderr": False, "Tty": True,
+                       "Cmd": ["/opt/hermes/.venv/bin/python", "-c", probe]})["Id"]
+    output = engine("POST", f"exec/{execution}/start", {"Detach": False, "Tty": True}, raw_output=True)
+    if engine("GET", f"exec/{execution}/json").get("ExitCode") != 0:
+        raise ValueError("authenticated readiness/native runtime resolution failed")
+    result = json.loads(next(line.removeprefix(b"HERMES_PROBE=") for line in output.splitlines() if line.startswith(b"HERMES_PROBE=")))
+    transaction["native_runtime"] = result
+    transaction["phase"] = "ready-pretraffic"
+    write(journal, json.dumps(transaction).encode())
+    current = engine("GET", f"containers/{SERVICE}/json")
+    if current["Id"] != old["Id"] or current["Image"] != old["Image"]:
+        raise ValueError("runtime changed before cutover")
+    # Preserve broken legacy metadata through Docker's own API; never edit its store.
+    if not legacy:
+        engine("POST", f"containers/{old['Id']}/stop?t=30")
+    engine("POST", f"containers/{old['Id']}/rename?name={SERVICE}-preserved-{expected[:12]}")
+    engine("POST", f"containers/{new_id}/rename?name={SERVICE}")
+    # Commit the journal BEFORE network exposure. After this point never rewind
+    # the new home or delete new data, even if a later functional gate fails.
+    transaction["phase"] = "traffic-committing"
+    write(journal, json.dumps(transaction).encode())
+    transaction["traffic_committed"] = True
+    engine("POST", f"networks/{NETWORK}/connect", {"Container": new_id, "EndpointConfig": {"Aliases": [SERVICE]}})
+    final = engine("GET", f"containers/{SERVICE}/json")
+    if final["Image"] != image_id or not final["State"]["Running"] or NETWORK not in final["NetworkSettings"]["Networks"]:
+        raise ValueError("private cutover identity mismatch; preserve new state")
+    transaction["phase"] = "private-ready"
+    write(journal, json.dumps(transaction).encode())
+    print(f"Native Hermes private-ready source={target} image={image_id} backup={backup}; legacy runtime is not a working rollback")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        transaction = ATTEMPT.get("transaction")
+        if transaction and not transaction["traffic_committed"]:
+            try:
+                engine("POST", f"containers/{transaction['new_id']}/stop?t=10", stopped_ok=True)
+                candidate_state = engine("GET", f"containers/{transaction['new_id']}/json")
+                if candidate_state.get("Name") == "/" + SERVICE:
+                    engine("POST", f"containers/{transaction['new_id']}/rename?name={SERVICE}-candidate-{transaction['target'][:12]}")
+                old = engine("GET", f"containers/{transaction['old_id']}/json")
+                if old["Name"] != "/" + SERVICE:
+                    engine("POST", f"containers/{old['Id']}/rename?name={SERVICE}")
+                if ATTEMPT["old"]["State"]["Running"] and not old["State"]["Running"]:
+                    engine("POST", f"containers/{old['Id']}/start")
+                transaction["phase"] = "failed-pretraffic-preserved"
+                write(ATTEMPT["journal"], json.dumps(transaction).encode())
+            except Exception:
+                print("Pretraffic rollback incomplete; preserve journal/state and require fixed recovery", flush=True)
+        print(f"Fixed Hermes recovery failed closed: {type(error).__name__}", flush=True)
+        raise SystemExit(1)
+PY
