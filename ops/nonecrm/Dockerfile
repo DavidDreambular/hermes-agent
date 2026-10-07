@@ -21,7 +21,7 @@ WORKDIR /opt/hermes
 COPY . .
 # Match upstream's source-linked install so native build identity and bundled
 # resources resolve under /opt/hermes. The source stays immutable for UID 10000.
-RUN uv sync --frozen --no-dev --extra messaging
+RUN uv sync --frozen --no-dev --extra messaging --python /usr/local/bin/python3.13
 
 FROM python:3.13-slim-trixie@sha256:8fb4cfa1a2616d7b8e0c2175cc6ad68f5729c34ea8488c0b360d2934b7be9024
 COPY --from=builder /opt/sqlite-fixed/lib/libsqlite3.so.3.53.4 /usr/local/lib/
