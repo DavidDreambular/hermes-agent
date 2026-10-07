@@ -53,16 +53,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Detect committed runtime recipe
-        id: recipe
-        run: |
-          if [ -f ops/nonecrm/Dockerfile ]; then
-            printf 'available=true\n' >> "$GITHUB_OUTPUT"
-          else
-            printf 'available=false\n' >> "$GITHUB_OUTPUT"
-          fi
+      - name: Require committed runtime recipe
+        run: test -f ops/nonecrm/Dockerfile
       - name: Build and verify exact source
-        if: steps.recipe.outputs.available == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -74,7 +67,6 @@ jobs:
           docker image inspect nonecrm-hermes:verified > release/image.json
           docker save nonecrm-hermes:verified | gzip -1 > release/image.tar.gz
       - name: Attest archive and image metadata
-        if: steps.recipe.outputs.available == 'true'
         id: provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
@@ -83,12 +75,10 @@ jobs:
             release/image.json
           push-to-registry: false
       - name: Package independent build evidence
-        if: steps.recipe.outputs.available == 'true'
         env:
           BUNDLE_PATH: ${{ steps.provenance.outputs.bundle-path }}
         run: cp "$BUNDLE_PATH" release/attestation.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: steps.recipe.outputs.available == 'true'
         with:
           name: nonecrm-hermes-${{ github.sha }}
           path: release/
