@@ -39,7 +39,7 @@ def build(tools, output):
                 info = tarfile.TarInfo(member)
                 info.size, info.mode, info.mtime = len(data), 0o600, 0
                 package.addfile(info, io.BytesIO(data))
-    with Path(str(path) + ".sha256").open("x") as checksum:
+    with Path(str(path) + ".sha256").open("x", encoding="utf-8") as checksum:
         checksum.write(f"{digest(path.read_bytes())}  {name}\n")
     print(f"Built bounded capsule source={target} sha256={digest(path.read_bytes())}")
 
