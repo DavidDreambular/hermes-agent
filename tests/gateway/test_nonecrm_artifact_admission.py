@@ -119,6 +119,10 @@ def test_live_anonymous_github_policy_matches_writer_snapshot():
     module = component()
     target = module.source_json("branches/main")["commit"]["sha"]
     snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    public = module.source_json("rulesets/24670342")
+    differences = [key for key in ["updated_at", "enforcement", "conditions", "rules", "source"] if snapshot.get(key) != public.get(key)]
+    assert snapshot.get("bypass_actors") == [], f"writer snapshot lacks empty bypass proof; keys={sorted(snapshot)}; differing_public_fields={differences}"
+    assert not differences, f"authenticated/anonymous policy shapes differ: {differences}"
     # Real anonymous HTTPS, no monkeypatch or credential in the container.
     module.verify_canonical(target, snapshot)
 
