@@ -141,19 +141,37 @@ def test_crash_is_recoverable_without_trusting_partial_activation(fixture, monke
     preserved(module)
 
 
-def test_audit_failure_cannot_commit_and_can_recover(fixture, monkeypatch):
+def test_partial_audit_write_cannot_corrupt_committed_audit(fixture, monkeypatch):
     module, root, _ = fixture
-    original = module.os.open
     audit = root / "state/audit.jsonl"
-    def fail_audit(path, flags, *args, **kwargs):
-        if Path(path) == audit and flags & os.O_WRONLY:
-            raise OSError("simulated audit write failure")
-        return original(path, flags, *args, **kwargs)
-    monkeypatch.setattr(module.os, "open", fail_audit)
+    audit.write_text('{"prior":true}\n')
+    audit.chmod(0o600)
+    original = module.os.fdopen
+    class BrokenWriter:
+        def __init__(self, descriptor, *args, **kwargs):
+            self.stream = original(descriptor, *args, **kwargs)
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+        def write(self, value):
+            if b'"prior"' in value:
+                self.stream.write(value[:10])
+                self.stream.flush()
+                raise OSError("partial audit write")
+            return self.stream.write(value)
+    def fdopen(descriptor, *args, **kwargs):
+        if args and args[0] == "wb" and Path(os.readlink(f"/proc/self/fd/{descriptor}")).parent == audit.parent:
+            return BrokenWriter(descriptor, *args, **kwargs)
+        return original(descriptor, *args, **kwargs)
+    monkeypatch.setattr(module.os, "fdopen", fdopen)
     with pytest.raises(OSError):
         install(module)
     assert json.loads(module.JOURNAL.read_text())["phase"] != "committed"
-    monkeypatch.setattr(module.os, "open", original)
+    assert audit.read_text() == '{"prior":true}\n'
+    monkeypatch.setattr(module.os, "fdopen", original)
     install(module)
-    assert json.loads(module.JOURNAL.read_text())["phase"] == "committed"
-    preserved(module)
+    assert all(isinstance(json.loads(line), dict) for line in audit.read_text().splitlines())

@@ -178,16 +178,15 @@ def install(authorization, package_sha):
             transaction["phase"] = "rolled-back"
             atomic_bytes(JOURNAL, json.dumps(transaction, sort_keys=True).encode(), 0o600)
             raise
-        with os.fdopen(os.open(audit, os.O_APPEND | os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600), "a", encoding="utf-8") as output:
-            info = os.fstat(output.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600:
-                raise ValueError("unsafe audit descriptor")
-            output.write(json.dumps({"authorization": authorization, "package_sha256": package_sha,
-                                     "installed": manifest, "prior_components": "absent-or-identical",
-                                     "preserved_guard_hashes": EXPECTED}, sort_keys=True) + "\n")
-            output.flush()
-            os.fsync(output.fileno())
-        sync_directory(audit.parent)
+        # Atomic audit replacement cannot leave a partial appended JSON tail.
+        previous = audit.read_bytes() if audit.exists() else b""
+        if len(previous) > 1_000_000 or previous and not previous.endswith(b"\n"):
+            raise ValueError("unsafe existing audit history")
+        for line in previous.splitlines():
+            json.loads(line)
+        record = {"authorization": authorization, "package_sha256": package_sha, "installed": manifest,
+                  "prior_components": "absent-or-identical", "preserved_guard_hashes": EXPECTED}
+        atomic_bytes(audit, previous + json.dumps(record, sort_keys=True).encode() + b"\n", 0o600)
         transaction["phase"] = "committed"
         atomic_bytes(JOURNAL, json.dumps(transaction, sort_keys=True).encode(), 0o600)
         print("Installed bounded Hermes admission; existing guard, source runner and policy unchanged.")
