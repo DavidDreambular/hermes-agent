@@ -38,7 +38,13 @@ jobs:
           if [ -f tests/gateway/test_nonecrm_native_config.py ]; then
             files+=(tests/gateway/test_nonecrm_native_config.py)
           fi
+          if [ -f tests/gateway/test_nonecrm_artifact_admission.py ]; then
+            files+=(tests/gateway/test_nonecrm_artifact_admission.py)
+          fi
           HOME="$(mktemp -d)" scripts/run_tests.sh -j 2 --file-retries 0 "${files[@]}"
+      - name: Verify isolated root bootstrap transactions
+        run: |
+          sudo env -i PATH="$PATH" HOME=/root HERMES_PYTHON="$PWD/.venv/bin/python" bash scripts/run_tests.sh -j 1 --file-retries 0 tests/gateway/test_nonecrm_admission_bootstrap.py
 
   artifact:
     needs: tests
