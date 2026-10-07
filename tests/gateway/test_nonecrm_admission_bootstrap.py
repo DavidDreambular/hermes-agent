@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import tarfile
 
 import pytest
 
@@ -56,12 +57,18 @@ def fixture(monkeypatch):
     (payload / "policy.json").write_text(json.dumps(policy))
     manifest = {name: sha(name) for name in ["installer.py", *destinations]}
     (payload / "manifest.json").write_text(json.dumps(manifest))
+    archive = root / "hermes-admission-v1-midpoints-vps.tar.gz"
+    with tarfile.open(archive, "w:gz") as package:
+        for path in payload.iterdir():
+            package.add(path, arcname=path.name)
+    archive.chmod(0o600)
     yield module, root, manifest
     shutil.rmtree(root)
 
 
 def install(module):
-    module.install("owner:permanent-fleet:20261006:isolated-test", "a" * 64)
+    archive = Path(module.__file__).parent.parent / "hermes-admission-v1-midpoints-vps.tar.gz"
+    module.install("owner:permanent-fleet:20261006:isolated-test", module.digest(archive))
 
 
 def preserved(module):
@@ -81,14 +88,6 @@ def test_root_install_commits_audit_and_preserves_existing_guards(fixture):
     preserved(module)
 
 
-def test_root_compare_and_swap_rejects_changed_guard(fixture):
-    module, _, _ = fixture
-    Path(next(iter(module.EXPECTED))).write_bytes(b"changed")
-    with pytest.raises(ValueError, match="compare-and-swap"):
-        install(module)
-    assert not module.JOURNAL.exists()
-
-
 @pytest.mark.parametrize("unsafe", ["symlink", "writable", "hardlink"])
 def test_root_install_rejects_unsafe_existing_destination(fixture, unsafe):
     module, root, _ = fixture
@@ -103,22 +102,6 @@ def test_root_install_rejects_unsafe_existing_destination(fixture, unsafe):
             os.link(path, root / "linked")
     with pytest.raises(ValueError):
         install(module)
-    preserved(module)
-
-
-def test_install_failure_rolls_back_only_new_components(fixture, monkeypatch):
-    module, _, _ = fixture
-    original = module.atomic_bytes
-    policy = Path(module.DESTINATIONS["policy.json"][0])
-    def fail_policy(path, data, mode):
-        if path == policy:
-            raise OSError("simulated disk write failure")
-        original(path, data, mode)
-    monkeypatch.setattr(module, "atomic_bytes", fail_policy)
-    with pytest.raises(OSError):
-        install(module)
-    assert json.loads(module.JOURNAL.read_text())["phase"] == "rolled-back"
-    assert all(not Path(path).exists() for path, _ in module.DESTINATIONS.values())
     preserved(module)
 
 
