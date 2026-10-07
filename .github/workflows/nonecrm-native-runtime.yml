@@ -72,6 +72,16 @@ jobs:
           mkdir release
           docker image inspect nonecrm-hermes:verified > release/image.json
           docker save nonecrm-hermes:verified | gzip -1 > release/image.tar.gz
+      - name: Verify fixed recovery in isolated root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --hostname MidPointsIA --user 0 --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --security-opt no-new-privileges \
+            --mount type=bind,src="$PWD",dst=/source,readonly --entrypoint /bin/bash nonecrm-hermes:verified -c '
+              /usr/local/bin/python -m pip --python /opt/hermes/.venv/bin/python install pytest==8.4.2 pytest-asyncio==1.2.0 pytest-timeout==2.4.0 >/dev/null
+              mkdir /root/repo
+              cp -r /source/scripts /source/tests /source/ops /source/pyproject.toml /root/repo/
+              HOME=/root HERMES_PYTHON=/opt/hermes/.venv/bin/python HERMES_TEST_FILE_RETRIES=0 /root/repo/scripts/run_tests.sh -j 1 tests/gateway/test_nonecrm_recovery_root.py'
       - name: Attest archive and image metadata
         id: provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
