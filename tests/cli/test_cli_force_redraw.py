@@ -408,9 +408,12 @@ class TestFocusRegainRedraw:
 
         assert calls == ["redraw"]
 
-    def test_focus_regain_redraw_is_rate_limited(self, bare_cli):
+    def test_focus_regain_redraw_is_rate_limited(self, bare_cli, monkeypatch):
         calls = []
         bare_cli._force_full_redraw = lambda: calls.append("redraw")
+        # A fresh CI runner's monotonic origin may be below the 60-second
+        # interval. Control the clock so this tests throttling, not host uptime.
+        monkeypatch.setattr(cli_mod.time, "monotonic", lambda: 100.0)
 
         bare_cli._schedule_focus_regain_redraw(min_interval=60.0)
         bare_cli._schedule_focus_regain_redraw(min_interval=60.0)
