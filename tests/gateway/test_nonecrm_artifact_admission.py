@@ -112,6 +112,44 @@ def test_anonymous_policy_requires_current_snapshot_after_signature_verification
         module.verify_canonical(target, snapshot)
 
 
+def test_local_owner_reader_does_not_use_rate_limited_public_reader(monkeypatch):
+    module = component()
+    target = "a" * 40
+    policy = json.loads((Path(__file__).parents[1] / "fixtures/nonecrm/source-policy.json").read_text(encoding="utf-8"))
+    monkeypatch.setattr(module, "source_json", lambda _: pytest.fail("local builder must use its authenticated owner reader"))
+    reader = lambda endpoint: {"protected": True, "commit": {"sha": target}} if endpoint == "branches/main" else policy
+    module.verify_canonical(target, policy, source_reader=reader)
+
+
+def test_builder_packages_the_exact_policy_object_it_validates(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2] / "ops/nonecrm"))
+    from build_admission_capsule import capture_owner_policy
+    target = "a" * 40
+    policy = json.loads((Path(__file__).parents[1] / "fixtures/nonecrm/source-policy.json").read_text(encoding="utf-8"))
+    calls = []
+    def reader(endpoint):
+        calls.append(endpoint)
+        if endpoint == "rulesets/24670342":
+            assert calls.count(endpoint) == 1, "do not validate a later policy while packaging the earlier snapshot"
+            return policy
+        return {"protected": True, "commit": {"sha": target}}
+    assert capture_owner_policy(target, reader) is policy
+    assert calls == ["rulesets/24670342", "branches/main"]
+
+
+def test_builder_subprocess_pins_github_host(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2] / "ops/nonecrm"))
+    import build_admission_capsule as builder
+    monkeypatch.setenv("GH_HOST", "example.com")
+    calls = []
+    def execute(argv, **kwargs):
+        calls.append(argv)
+        return '{"id":24670342}'
+    monkeypatch.setattr(builder.subprocess, "check_output", execute)
+    assert builder.owner_api(Path("/pinned/gh"), "rulesets/24670342") == {"id": 24670342}
+    assert calls == [["/pinned/gh", "api", "--hostname", "github.com", "repos/DavidDreambular/hermes-agent/rulesets/24670342"]]
+
+
 def test_live_anonymous_github_policy_matches_public_snapshot():
     snapshot_path = Path("/signed-fixture/source-policy.json")
     if os.geteuid() != 0 or not snapshot_path.exists():
