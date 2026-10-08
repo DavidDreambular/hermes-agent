@@ -112,6 +112,15 @@ def test_anonymous_policy_requires_current_snapshot_after_signature_verification
         module.verify_canonical(target, snapshot)
 
 
+def test_local_owner_reader_does_not_use_rate_limited_public_reader(monkeypatch):
+    module = component()
+    target = "a" * 40
+    policy = json.loads((Path(__file__).parents[1] / "fixtures/nonecrm/source-policy.json").read_text(encoding="utf-8"))
+    monkeypatch.setattr(module, "source_json", lambda _: pytest.fail("local builder must use its authenticated owner reader"))
+    reader = lambda endpoint: {"protected": True, "commit": {"sha": target}} if endpoint == "branches/main" else policy
+    module.verify_canonical(target, policy, source_reader=reader)
+
+
 def test_live_anonymous_github_policy_matches_public_snapshot():
     snapshot_path = Path("/signed-fixture/source-policy.json")
     if os.geteuid() != 0 or not snapshot_path.exists():

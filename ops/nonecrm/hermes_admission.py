@@ -108,11 +108,12 @@ def source_json(endpoint):
     return json.loads(raw)
 
 
-def verify_canonical(target, policy_snapshot=None, prepare=False):
-    branch = source_json("branches/main")
+def verify_canonical(target, policy_snapshot=None, prepare=False, source_reader=None):
+    reader = source_reader or source_json
+    branch = reader("branches/main")
     if branch.get("protected") is not True or branch.get("commit", {}).get("sha") != target:
         raise ValueError("source is not the exact protected canonical commit")
-    ruleset = source_json("rulesets/24670342")
+    ruleset = reader("rulesets/24670342")
     rules = {rule.get("type"): rule for rule in ruleset.get("rules", [])}
     if (ruleset.get("enforcement") != "active"
             or "refs/heads/main" not in ruleset.get("conditions", {}).get("ref_name", {}).get("include", [])

@@ -26,8 +26,9 @@ def build(tools, output):
     digest = lambda data: hashlib.sha256(data).hexdigest()
     if digest(entries["gh"]) != GH_SHA or digest(entries["trusted-root.jsonl"]) != ROOTS_SHA:
         raise ValueError("public verifier resources are not the reviewed pinned bytes")
-    snapshot = json.loads(subprocess.check_output([str(tools / "gh"), "api", "repos/DavidDreambular/hermes-agent/rulesets/24670342"], text=True))
-    verify_canonical(target, snapshot)
+    reader = lambda endpoint: json.loads(subprocess.check_output([str(tools / "gh"), "api", f"repos/DavidDreambular/hermes-agent/{endpoint}"], text=True))
+    snapshot = reader("rulesets/24670342")
+    verify_canonical(target, snapshot, source_reader=reader)
     policy = {"schema": 1, "enabled": True, "service": "nonecrm-hermes-agent", "repository": "DavidDreambular/hermes-agent",
               "gh_sha256": GH_SHA, "roots_sha256": ROOTS_SHA, "admission_sha256": digest(entries["admission.py"]),
               "source_policy_snapshot": snapshot}
