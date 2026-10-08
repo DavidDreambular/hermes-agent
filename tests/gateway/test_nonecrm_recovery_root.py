@@ -1,5 +1,6 @@
 """Fixed program against a real Unix HTTP boundary in an isolated root container."""
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -8,13 +9,14 @@ import socket
 import socketserver
 import subprocess
 import threading
+import tarfile
 import time
 
 import pytest
 
 
 @pytest.mark.linux_only
-@pytest.mark.parametrize("failure", [None, "signature", "candidate-exit", "rename", "journal", "probe", "exited-journal", "live-success", "pause-response", "native-repeat"])
+@pytest.mark.parametrize("failure", [None, "signature", "candidate-exit", "rename", "journal", "probe", "exited-journal", "live-success", "pause-response", "native-repeat", "containerd", "containerd-repeat"])
 def test_isolated_fixed_recovery_transaction(failure):
     if os.geteuid() != 0 or socket.gethostname() != "MidPointsIA" or not Path("/.dockerenv").exists():
         pytest.skip("requires dedicated isolated Docker root fixture without host socket")
@@ -23,16 +25,21 @@ def test_isolated_fixed_recovery_transaction(failure):
     source = Path("/opt/production-sources/nonecrm-hermes-agent-source")
     assert not source.exists()
     target, expected = "a" * 40, "2bd1977d8fad185c9b4be47884f7e87f1add0ce3"
-    live = failure in {"live-success", "pause-response", "native-repeat"}
-    repeat = failure == "native-repeat"
-    failed = failure is not None and not repeat
+    live = failure in {"live-success", "pause-response", "native-repeat", "containerd-repeat"}
+    repeat = failure in {"native-repeat", "containerd-repeat"}
+    containerd = failure in {"containerd", "containerd-repeat"}
+    failed = failure is not None and not repeat and not containerd
     if live:
         expected = "c" * 40
     old_id = "cf415bbe164a37938c9b655a112fba51150206818c1d1c7e4595c86fd090b2d0"
     old_image = "sha256:b2ee88947e66c349dbefeae5c6e1fd846d7b4d5f938fe2d3f04aeeecc09c11fc"
-    image_id = "sha256:" + "b" * 64
+    config_bytes = b'{"architecture":"amd64","os":"linux"}'
+    image_id = "sha256:" + hashlib.sha256(config_bytes).hexdigest()
+    manifest_bytes = json.dumps({"schemaVersion": 2, "config": {"digest": image_id}, "layers": []}).encode()
+    manifest_id = "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+    runtime_id = manifest_id if containerd else image_id
     if repeat:
-        expected, old_image = target, image_id
+        expected, old_image = target, runtime_id
     home = Path("/var/lib/docker/volumes/1abf8bf156c0b133516d33681e3088327c993b670b773e608a729cc77194fe1e/_data")
     stage = Path("/var/lib/production-guard/hermes-artifacts") / target
     config = Path("/etc/production-guard/services.d/nonecrm-hermes-agent--production.conf")
@@ -46,9 +53,16 @@ def test_isolated_fixed_recovery_transaction(failure):
     shutil.copyfile(fixture_config, config)
     profile = Path(__file__).parents[2] / "ops/nonecrm/config.example.yaml"
     shutil.copyfile(profile, source / "ops/nonecrm/config.example.yaml")
+    shutil.copyfile(Path(__file__).parents[2] / "ops/nonecrm/archive_identity.py", source / "ops/nonecrm/archive_identity.py")
     os.chown(home, 10000, 10000)
     (home / "history.txt").write_text("preserve-existing-state")
-    (stage / "image.tar.gz").write_bytes(b"fixture-only-boundary-image")
+    index_bytes = json.dumps({"schemaVersion": 2, "manifests": [{"digest": manifest_id}]}).encode()
+    with tarfile.open(stage / "image.tar.gz", "w:gz") as package:
+        for name, data in {"index.json": index_bytes, "blobs/sha256/" + manifest_id.removeprefix("sha256:"): manifest_bytes,
+                           "blobs/sha256/" + image_id.removeprefix("sha256:"): config_bytes}.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(data)
+            package.addfile(member, io.BytesIO(data))
     (stage / "attestation.json").write_text("fixture-only-verifier-boundary")
     (stage / "image.json").write_text(json.dumps([{"Id": image_id, "Size": 10000}]))
     hashes = {name: hashlib.sha256((stage / name).read_bytes()).hexdigest() for name in ["image.tar.gz", "image.json", "attestation.json"]}
@@ -92,7 +106,10 @@ def test_isolated_fixed_recovery_transaction(failure):
             elif path.endswith("containers/nonecrm-app/json"):
                 response = {"Config": {"Env": ["HERMES_AGENT_API_KEY=fixture-key-1234567890", "OPENROUTER_API_KEY=fixture-key-0987654321"]}}
             elif "/images/" in path:
-                response = {"Id": image_id, "Config": {"Labels": {"org.opencontainers.image.revision": target}}}
+                if not containerd and manifest_id in path:
+                    status, response = 404, {"message": "configuration-addressed store"}
+                else:
+                    response = {"Id": runtime_id, "Config": {"Labels": {"org.opencontainers.image.revision": target}}}
             elif "/containers/create?" in path:
                 new.update({"Id": "new-id", "Image": body["Image"], "State": {"Running": failure != "candidate-exit", "Health": {"Status": "healthy"}}, "NetworkSettings": {"Networks": {}}})
                 response = {"Id": "new-id"}

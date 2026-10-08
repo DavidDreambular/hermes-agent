@@ -6,6 +6,7 @@ exec /usr/bin/python3 -I - "$@" <<'PY'
 import fcntl
 import hashlib
 import http.client
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -46,7 +47,9 @@ def engine(method, path, body=None, raw_output=False, stopped_ok=False):
     status = response.status
     connection.close()
     if status >= 300 and not (stopped_ok and status == 304 and method == "POST" and "/stop?" in path):
-        raise RuntimeError(f"fixed engine operation failed: {method} {path.split('?')[0]} status={status}")
+        error = RuntimeError(f"fixed engine operation failed: {method} {path.split('?')[0]} status={status}")
+        error.status = status
+        raise error
     return raw if raw_output else json.loads(raw) if raw else None
 
 
@@ -96,6 +99,11 @@ def main():
     if run("git", "-C", str(SOURCE), "rev-parse", "HEAD") != target or run("git", "-C", str(SOURCE), "status", "--porcelain"):
         raise ValueError("canonical source changed")
     run("git", "-C", str(SOURCE), "merge-base", "--is-ancestor", expected, target)
+    identity_path = SOURCE / "ops/nonecrm/archive_identity.py"
+    secure(identity_path)
+    spec = importlib.util.spec_from_file_location("archive_identity", identity_path)
+    identities = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(identities)
     secure(Path("/run/production-guard") / f"{SERVICE}--production.active")
     config_path = Path("/etc/production-guard/services.d") / f"{SERVICE}--production.conf"
     old = engine("GET", f"containers/{SERVICE}/json")
@@ -115,7 +123,9 @@ def main():
             run("/usr/local/libexec/production-guard/hermes-artifact-admit", "admit", target)
             receipt_path = STATE / "hermes-artifacts" / target / "admitted.json"
             secure(receipt_path)
-            if json.loads(receipt_path.read_text())["image"] != old["Image"]:
+            admitted = json.loads(receipt_path.read_text())
+            accepted = identities.archive_image_refs(receipt_path.parent / "image.tar.gz", admitted["image"])
+            if old["Image"] not in accepted:
                 raise ValueError("unchanged runtime differs from independently admitted image")
             print(f"Verified unchanged native runtime source={target}; no state/auth fork or runtime mutation")
             return
@@ -138,6 +148,7 @@ def main():
             raise ValueError("admitted artifact changed")
     image = json.loads((stage / "image.json").read_text())[0]
     image_id = receipt["image"]
+    accepted_image_ids = identities.archive_image_refs(stage / "image.tar.gz", image_id)
     if image["Id"] != image_id or shutil.disk_usage("/opt").free < image["Size"] * 3 + 268435456:
         raise ValueError("image identity/capacity gate failed")
     ROOT.mkdir(mode=0o700, exist_ok=True)
@@ -191,12 +202,24 @@ def main():
     # Loading is possible only after independent admission; no handwritten approval.
     with (stage / "image.tar.gz").open("rb") as stream:
         subprocess.run(["/usr/bin/docker", "image", "load"], stdin=stream, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=180)
-    loaded = engine("GET", "images/" + image_id + "/json")
-    if loaded["Id"] != image_id or loaded["Config"].get("Labels", {}).get("org.opencontainers.image.revision") != target:
+    # Classic Docker exposes the config digest; the containerd store exposes the
+    # OCI manifest digest. Both must be content-addressed links in the signed tar.
+    loaded = None
+    for reference in accepted_image_ids:
+        try:
+            loaded = engine("GET", "images/" + reference + "/json")
+            break
+        except RuntimeError as error:
+            if getattr(error, "status", None) != 404:
+                raise
+    if (loaded is None or loaded["Id"] not in accepted_image_ids
+            or loaded["Config"].get("Labels", {}).get("org.opencontainers.image.revision") != target):
         raise ValueError("loaded image differs from signed identity")
+    image_id = loaded["Id"]
     candidate = SERVICE + "-candidate-" + target[:12]
     journal = release / "transaction.json"
     transaction = {"phase": "prepared", "target": target, "old_id": old["Id"], "new_id": None,
+                   "runtime_image": image_id, "signed_config_image": receipt["image"],
                    "old_runtime_usable": not legacy, "backup": str(backup), "traffic_committed": False}
     write(journal, json.dumps(transaction).encode())
     created = engine("POST", "containers/create?name=" + candidate, {
