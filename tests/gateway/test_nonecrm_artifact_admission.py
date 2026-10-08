@@ -137,6 +137,19 @@ def test_builder_packages_the_exact_policy_object_it_validates(monkeypatch):
     assert calls == ["rulesets/24670342", "branches/main"]
 
 
+def test_builder_subprocess_pins_github_host(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2] / "ops/nonecrm"))
+    import build_admission_capsule as builder
+    monkeypatch.setenv("GH_HOST", "example.com")
+    calls = []
+    def execute(argv, **kwargs):
+        calls.append(argv)
+        return '{"id":24670342}'
+    monkeypatch.setattr(builder.subprocess, "check_output", execute)
+    assert builder.owner_api(Path("/pinned/gh"), "rulesets/24670342") == {"id": 24670342}
+    assert calls == [["/pinned/gh", "api", "--hostname", "github.com", "repos/DavidDreambular/hermes-agent/rulesets/24670342"]]
+
+
 def test_live_anonymous_github_policy_matches_public_snapshot():
     snapshot_path = Path("/signed-fixture/source-policy.json")
     if os.geteuid() != 0 or not snapshot_path.exists():
