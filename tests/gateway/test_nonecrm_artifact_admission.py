@@ -121,6 +121,22 @@ def test_local_owner_reader_does_not_use_rate_limited_public_reader(monkeypatch)
     module.verify_canonical(target, policy, source_reader=reader)
 
 
+def test_builder_packages_the_exact_policy_object_it_validates(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2] / "ops/nonecrm"))
+    from build_admission_capsule import capture_owner_policy
+    target = "a" * 40
+    policy = json.loads((Path(__file__).parents[1] / "fixtures/nonecrm/source-policy.json").read_text(encoding="utf-8"))
+    calls = []
+    def reader(endpoint):
+        calls.append(endpoint)
+        if endpoint == "rulesets/24670342":
+            assert calls.count(endpoint) == 1, "do not validate a later policy while packaging the earlier snapshot"
+            return policy
+        return {"protected": True, "commit": {"sha": target}}
+    assert capture_owner_policy(target, reader) is policy
+    assert calls == ["rulesets/24670342", "branches/main"]
+
+
 def test_live_anonymous_github_policy_matches_public_snapshot():
     snapshot_path = Path("/signed-fixture/source-policy.json")
     if os.geteuid() != 0 or not snapshot_path.exists():
