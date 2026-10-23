@@ -2,7 +2,11 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
-**Never give up on the right solution.**
+This is the owner-controlled Hermes Agent source repository, separate from any Hermes runtime installed for NoneCRM. `AGENTS.md` is the canonical repository guide; there is no root `CLAUDE.md`. The scoped `apps/desktop/AGENTS.md` applies only to Desktop and inherits this root guide.
+
+The engineering guidance below describes this codebase; it is not evidence of a live host, service, domain, or deployment authorization. Follow the parent Codex agreement, effective owner grant, and current repository protections wherever they apply. The owner-authorized prototype policy near the end of this file does not widen host permissions or override those controls.
+
+Continue toward the requested outcome through evidence-based alternatives. After two equivalent failures, change strategy and report the concrete unavailable capability instead of repeating the same attempt.
 
 ## What Hermes Is
 
@@ -1384,12 +1388,13 @@ Guard style note: check `draft_stream_is_message` with `is True` — MagicMock
 adapters in older tests auto-create truthy attributes.
 
 ### Squash merges from stale branches silently revert recent fixes
-Before squash-merging a PR, ensure the branch is up to date with `main`
-(`git fetch origin main && git reset --hard origin/main` in the worktree,
-then re-apply the PR's commits). A stale branch's version of an unrelated
-file will silently overwrite recent fixes on main when squashed. Verify
-with `git diff HEAD~1..HEAD` after merging — unexpected deletions are a
-red flag.
+Before integrating a PR, compare its exact base and head and inspect the full
+diff for unrelated changes that could restore stale files. Do not use
+`git reset --hard` to refresh a branch: it can erase uncommitted or task-owned
+work. If a shared branch needs refreshing, create a new clean isolated branch
+from the current protected base and reapply only the reviewed commits; retain
+the original branch until the replacement diff is verified. Never bypass the
+repository's protected-branch PR flow.
 
 ### Don't wire in dead code without E2E validation
 Unused code that was never shipped was dead for a reason. Before wiring an
