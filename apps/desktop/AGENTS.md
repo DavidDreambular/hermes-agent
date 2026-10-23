@@ -5,8 +5,9 @@ it teaches the invariants and the reasoning behind them so a change fits the app
 even as files move. Read it with the repository `AGENTS.md` (root rules still
 apply) and [`DESIGN.md`](./DESIGN.md) for the visual and interaction contract.
 
-When a rule here and the code disagree, trust the code and fix whichever is
-wrong — but never break an invariant to make a change easier.
+When a documented engineering detail and the code disagree, verify the actual
+behavior and update whichever is stale. This scoped guide never overrides the
+root `AGENTS.md`, owner authorization, or security/platform controls.
 
 ## What this app is
 
